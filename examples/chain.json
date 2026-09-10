@@ -1,0 +1,46 @@
+{
+  "name": "gearbox-end-play",
+  "description": "减速箱轴向端隙：壳体 + 隔套(均匀, 英寸件) + 轴承(英寸) - 轴；壳体/轴来料正相关 0.25",
+  "closure_lower_limit": 0.05,
+  "closure_upper_limit": 0.60,
+  "dimensions": [
+    {
+      "id": "L1",
+      "start": "a",
+      "end": "b",
+      "nominal": 50,
+      "upper_deviation": 0.08,
+      "lower_deviation": 0.0,
+      "unit": "mm",
+      "distribution": "normal",
+      "std_dev": 0.02
+    },
+    {
+      "id": "L2",
+      "start": "b",
+      "end": "c",
+      "nominal": 30.3,
+      "upper_deviation": 0.05,
+      "lower_deviation": -0.05,
+      "unit": "mm",
+      "distribution": "uniform"
+    },
+    {
+      "id": "L3",
+      "start": "c",
+      "end": "a",
+      "nominal": 80,
+      "upper_deviation": 0.0,
+      "lower_deviation": -0.15,
+      "unit": "mm",
+      "distribution": "normal",
+      "std_dev": 0.04,
+      "direction": -1
+    }
+  ],
+  "correlations": [
+    {"dim_a": "L1", "dim_b": "L3", "rho": 0.25}
+  ],
+  "mc_samples": 200000,
+  "random_seed": 20260910
+}

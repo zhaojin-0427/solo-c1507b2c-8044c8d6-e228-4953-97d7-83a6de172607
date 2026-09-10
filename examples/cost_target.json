@@ -1,0 +1,8 @@
+{
+  "target_reject_rate": 0.00001,
+  "tightening_cost": {"L1": 10.0, "L2": 3.0, "L3": 6.0},
+  "default_cost": 5.0,
+  "scale_levels": [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+  "scale_normal_sigma": true,
+  "max_evaluations": 4000
+}

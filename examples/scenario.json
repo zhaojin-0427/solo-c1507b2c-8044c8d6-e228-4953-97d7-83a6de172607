@@ -1,0 +1,10 @@
+{
+  "name": "supplier-improved-L1",
+  "note": "供应商改进：L1 改为 0~+0.04 单边；L3 来料 σ 从 0.04 降到 0.025",
+  "tolerance_overrides": {
+    "L1": {"upper_deviation": 0.04, "lower_deviation": 0.0}
+  },
+  "std_dev_overrides": {
+    "L3": 0.025
+  }
+}

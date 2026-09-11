@@ -217,6 +217,17 @@ class ScenarioCreate(BaseModel):
     std_dev_overrides: dict[str, float | None] = Field(default_factory=dict)
     random_seed: int | None = Field(None, ge=0)
 
+    @model_validator(mode="after")
+    def _check_std_dev(self) -> "ScenarioCreate":
+        negative = {k: v for k, v in self.std_dev_overrides.items()
+                    if v is not None and v < 0}
+        if negative:
+            detail = ", ".join(f"{k}={v}" for k, v in negative.items())
+            raise ValueError(
+                f"标准差不能为负（请改用 0 表示零方差固定尺寸）: {detail}"
+            )
+        return self
+
 
 class ToleranceOverride(BaseModel):
     upper_deviation: float

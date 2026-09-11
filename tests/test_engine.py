@@ -1,6 +1,8 @@
 """计算正确性测试：手工核对 WC / RSS / MC 与相关系数影响。"""
 import math
 
+import numpy as np
+
 import pytest
 
 from app.engine import (
@@ -110,6 +112,58 @@ def test_monte_carlo_correlation_via_copula():
     mc = compute_all(nc)["results"]["monte_carlo"]
     rss = compute_all(nc)["results"]["rss"]
     assert abs(mc["sigma_mm"] - rss["sigma_mm"]) / rss["sigma_mm"] < 0.03
+
+
+def test_opposed_uniform_rho_consistency():
+    """用户缺陷：两个反向均匀尺寸 ρ=0.8、σ=0.05，MC σ 必须与 RSS 一致。
+
+    未校准的 copula 潜变量相关会导致 3.5% 偏差；校准后应 <0.2%。
+    """
+    dims = [
+        {"id": "A", "start": "a", "end": "b", "nominal": 10.0,
+         "upper_deviation": 0.2, "lower_deviation": -0.2,
+         "distribution": "uniform", "std_dev": 0.05},
+        {"id": "B", "start": "b", "end": "a", "nominal": 10.0,
+         "upper_deviation": 0.2, "lower_deviation": -0.2,
+         "distribution": "uniform", "std_dev": 0.05, "direction": -1},
+    ]
+    nc = normalize_chain(
+        _make(dims, [CorrelationSpec(dim_a="A", dim_b="B", rho=0.8)],
+              lsl=-1, usl=1, samples=400_000))
+    res = compute_all(nc)["results"]
+    rss = res["rss"]["sigma_mm"]
+    mc = res["monte_carlo"]["sigma_mm"]
+    # 解析期望：σ_A²+σ_B²-2·0.8·σ_Aσ_B = 2·0.05²·0.2 = 0.001
+    assert rss == pytest.approx(math.sqrt(0.001), rel=1e-12)
+    assert abs(mc - rss) / rss < 0.002
+    # 样本边缘 Pearson 相关必须就是输入的 0.8
+    from app.engine import sample_dimensions
+    x = sample_dimensions(nc, 200_000, 7)
+    assert abs(float(np.corrcoef(x[:, 0], x[:, 1])[0, 1]) - 0.8) < 0.01
+
+
+@pytest.mark.parametrize("pair,target", [
+    (("uniform", "uniform"), 0.8),
+    (("uniform", "normal"), 0.8),
+    (("triangular", "uniform"), 0.8),
+    (("triangular", "triangular"), -0.6),
+    (("triangular", "normal"), 0.3),
+])
+def test_latent_rho_realizes_target_pearson(pair, target):
+    """潜变量相关校准后，边缘经验 Pearson 相关必须复现输入 ρ。"""
+    from app.engine import _latent_rho, _standard_quantile
+    rho0 = _latent_rho(pair[0], pair[1], target)
+    rng = np.random.default_rng(4242)
+    n = 200_000
+    z = rng.standard_normal((n, 2))
+    w2 = rho0 * z[:, 0] + math.sqrt(max(0.0, 1 - rho0 ** 2)) * z[:, 1]
+    erf = np.vectorize(math.erf)
+    q1 = 0.5 * (1 + erf(z[:, 0] / math.sqrt(2)))
+    q2 = 0.5 * (1 + erf(w2 / math.sqrt(2)))
+    g1 = _standard_quantile(q1, pair[0])
+    g2 = _standard_quantile(q2, pair[1])
+    got = float(np.corrcoef(g1, g2)[0, 1])
+    assert abs(got - target) < 0.01
 
 
 def test_gap_probability_methods():

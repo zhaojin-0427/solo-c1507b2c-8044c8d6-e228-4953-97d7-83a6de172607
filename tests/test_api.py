@@ -66,6 +66,26 @@ def test_scenario_unknown_dimension_rejected(client, simple_chain_payload):
     assert r.status_code == 422
 
 
+def test_scenario_negative_std_dev_rejected_before_save(
+        client, simple_chain_payload):
+    """缺陷回归：方案提交负 σ 必须在保存前 422，不能落库后显示正 σ。"""
+    cid = _create(client, simple_chain_payload)["chain_id"]
+    r = client.post(f"/chains/{cid}/scenarios", json={
+        "name": "negative-sigma",
+        "std_dev_overrides": {"L2": -0.01},
+    })
+    assert r.status_code == 422
+    assert "标准差" in r.text
+    # 没有产生任何方案分支
+    scs = client.get(f"/chains/{cid}/scenarios").json()["scenarios"]
+    assert all(s["name"] != "negative-sigma" for s in scs)
+    # 零仍合法（零方差固定尺寸）
+    r0 = client.post(f"/chains/{cid}/scenarios", json={
+        "name": "zero-sigma", "std_dev_overrides": {"L2": 0.0}})
+    assert r0.status_code == 201, r0.text
+    assert r0.json()["overrides"]["L2"]["std_dev"]["std_dev"] == 0.0
+
+
 def test_batch_adjust(client, simple_chain_payload):
     cid = _create(client, simple_chain_payload)["chain_id"]
     r = client.post(f"/chains/{cid}/batch-adjust", json={

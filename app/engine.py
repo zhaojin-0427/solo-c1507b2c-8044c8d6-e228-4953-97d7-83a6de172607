@@ -27,8 +27,11 @@
 
 蒙特卡洛 (MC)
     固定随机种子；独立维度直接抽样，存在相关系数时使用
-    Gaussian copula（由相关矩阵 Cholesky 分解得到相关正态，
-    再经概率积分变换得到相关均匀/三角变量）。
+    Gaussian copula。输入 ρ 统一为尺寸值的 Pearson 相关：
+    先逐对把 ρ 反演为潜变量正态相关 ρ0（正态恒等；均匀-均匀
+    ρ0=2sin(πρ/6)；均匀-正态 ρ0=ρ√(π/3)；三角配对固定样本标定），
+    再由 Cholesky 生成相关正态、Φ 变换后代入各分布逆 CDF，
+    因此抽样边缘 Pearson 相关与 RSS 公式中的 ρ 一致。
     输出样本均值、标准差、分位数、极值与经验超差率。
 """
 from __future__ import annotations
@@ -148,7 +151,7 @@ def normalize_chain(chain_create) -> NormalizedChain:
                 lower_dev=ei_mm,
                 mid=(es_mm + ei_mm) / 2.0,
                 half_width=t_mm,
-                sigma=max(sigma_mm, 0.0),
+                sigma=sigma_mm,
                 sigma_explicit=sigma_explicit,
                 distribution=d.distribution.value,
                 start=d.start,
@@ -355,6 +358,180 @@ def rss_analysis(nc: NormalizedChain, z: float = Z_STAT) -> dict:
 
 # ------------------------------------------------------------- 蒙特卡洛
 
+# Pearson 相关 ρ 的统一语义：RSS 公式与蒙特卡洛抽样的**边缘 Pearson 相关**
+# 都必须等于用户输入的 ρ。Gaussian copula 中需要校准的是潜变量正态相关
+# ρ0，使 g(Φ(Z1))、h(Φ(Z2))（Z 相关 ρ0）的 Pearson 相关恰为 ρ：
+#   uniform-uniform:  ρ = (6/π)·arcsin(ρ0/2)
+#   uniform-normal:    Corr(2Φ(Z1)-1, Z2) = ρ0·√(3/π)
+#   normal-normal:     ρ0 = ρ
+# 含 triangular 的配对无简单闭式，用固定样本二分标定（结果缓存）。
+
+_latent_cache: dict[tuple, float] = {}
+
+
+def _triangular_inverse(u: np.ndarray, half: float) -> np.ndarray:
+    """[-T, T] 上关于 0 对称的三角分布分位数函数。"""
+    out = np.empty_like(np.asarray(u, dtype=float))
+    u = np.asarray(u, dtype=float)
+    left = u < 0.5
+    out[left] = -half + half * np.sqrt(2.0 * u[left])
+    out[~left] = half - half * np.sqrt(2.0 * (1.0 - u[~left]))
+    return out
+
+
+def norm_ppf(u: np.ndarray) -> np.ndarray:
+    """标准正态分位数函数 Φ^{-1}（Peter Acklam 有理逼近，精度约 1e-9）。"""
+    a = [-3.969683028665376e+01, 2.209460984245205e+02,
+         -2.759285104469687e+02, 1.383577518672690e+02,
+         -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02,
+         -1.556989798598866e+02, 6.680131188771972e+01,
+         -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01,
+         -2.400758277161838e+00, -2.549732539343734e+00,
+         4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01,
+         2.445134137142996e+00, 3.754408661907416e+00]
+    u = np.asarray(u, dtype=float)
+    x = np.zeros_like(u)
+    plow, phigh = 0.02425, 1 - 0.02425
+
+    low = u < plow
+    if low.any():
+        q = np.sqrt(-2.0 * np.log(u[low]))
+        x[low] = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4])
+                  * q + c[5]) / \
+                 ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    high = u > phigh
+    if high.any():
+        q = np.sqrt(-2.0 * np.log(1.0 - u[high]))
+        x[high] = -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4])
+                    * q + c[5]) / \
+                  ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    mid = ~(low | high)
+    if mid.any():
+        q = u[mid] - 0.5
+        r = q * q
+        x[mid] = (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4])
+                  * r + a[5]) * q / \
+                 (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4])
+                  * r + 1.0)
+    return x
+
+
+def _standard_quantile(u: np.ndarray, distribution: str) -> np.ndarray:
+    """单位尺度边缘分位数（normal: Φ⁻¹; uniform: 2U-1; triangular: 半宽1）。"""
+    if distribution == DistributionType.NORMAL.value:
+        return norm_ppf(u)
+    if distribution == DistributionType.UNIFORM.value:
+        return 2.0 * np.asarray(u) - 1.0
+    return _triangular_inverse(u, 1.0)
+
+
+_calib_bank: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+_CALIB_SEED = 20260910
+
+
+def _calib_bank_arrays(n: int = 50_000):
+    """固定种子的标准正态两列及对应 Φ 值（标定用，进程缓存）。"""
+    if n not in _calib_bank:
+        rng = np.random.default_rng(_CALIB_SEED)
+        z = rng.standard_normal((n, 2))
+        u = 0.5 * (1.0 + np.vectorize(math.erf)(
+            z / math.sqrt(2.0)))
+        _calib_bank[n] = (z, u)
+    return _calib_bank[n]
+
+
+def _latent_rho(dist_a: str, dist_b: str, rho: float) -> float:
+    """返回使两边缘 Pearson 相关等于 rho 的潜变量正态相关 rho0。"""
+    if rho == 0.0:
+        return 0.0
+    N_, U_ = DistributionType.NORMAL.value, DistributionType.UNIFORM.value
+    key = tuple(sorted((dist_a, dist_b)))
+    cache_key = (key, round(rho, 12))
+    if cache_key in _latent_cache:
+        return _latent_cache[cache_key]
+
+    if dist_a == dist_b == N_:
+        rho0 = rho
+    elif key == (U_, U_):
+        # Corr(Φ(Z1), Φ(Z2)) = (6/π) arcsin(ρ0/2)
+        rho0 = 2.0 * math.sin(math.pi * rho / 6.0)
+    elif N_ in key and U_ in key:
+        # 均匀单位边缘 X=2Φ(Z1)-1（方差 1/3）：
+        # E[X·Z2]=2·E[Φ(Z1)Z2]=2ρ0·E[Z1Φ(Z1)]
+        #        =2ρ0·E[φ(Z1)]=ρ0/√π（Stein 引理）
+        # => Corr = ρ0·√(3/π)，反演 ρ0 = ρ·√(π/3)
+        rho0 = rho * math.sqrt(math.pi / 3.0)
+    else:
+        rho0 = _calibrate_latent(dist_a, dist_b, rho)
+    rho0 = min(0.999999, max(-0.999999, rho0))
+    _latent_cache[cache_key] = rho0
+    return rho0
+
+
+def _calibrate_latent(dist_a: str, dist_b: str, rho: float) -> float:
+    """含 triangular 配对：固定样本上二分求使经验 Pearson 相关=rho 的 rho0。"""
+    z, _ = _calib_bank_arrays()
+    z1col = z[:, 0]
+    z2col = z[:, 1]
+    erf_vec = np.vectorize(math.erf)
+
+    def emp(rho0: float) -> float:
+        w2 = rho0 * z1col + math.sqrt(max(0.0, 1.0 - rho0 * rho0)) * z2col
+        q1 = 0.5 * (1.0 + erf_vec(z1col / math.sqrt(2.0)))
+        q2 = 0.5 * (1.0 + erf_vec(w2 / math.sqrt(2.0)))
+        # 直接由相关均匀值 q1、q2 生成两种边缘（保持 copula 结构）
+        g1 = _standard_quantile(q1, dist_a)
+        g2 = _standard_quantile(q2, dist_b)
+        return float(np.corrcoef(g1, g2)[0, 1])
+
+    lo, hi = -0.999999, 0.999999
+    # 5 万固定样本的经验相关噪声约 4e-3，二分 18 次即低于该噪声底
+    for _ in range(18):
+        mid = 0.5 * (lo + hi)
+        if emp(mid) < rho:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _nearest_psd(r0: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """把相关矩阵投影到最近的正定相关矩阵（谱截断后重标定对角为 1）。"""
+    r = (r0 + r0.T) / 2.0
+    w, v = np.linalg.eigh(r)
+    w = np.clip(w, eps, None)
+    r = (v * w[None, :]) @ v.T
+    d = np.sqrt(np.diag(r))
+    r = r / d[:, None] / d[None, :]
+    return (r + r.T) / 2.0
+
+
+def latent_correlation_matrix(nc: NormalizedChain) -> np.ndarray:
+    """把用户 Pearson 相关矩阵逐对换算为 copula 潜变量相关矩阵。
+
+    逐对换算可能破坏整体正定性（高相关 + 混合分布），用最近正定相关
+    矩阵投影兜底；输入矩阵本身已由 schema 校验为半正定。
+    """
+    k = len(nc.dimensions)
+    r0 = np.eye(k)
+    r = nc.corr
+    for i in range(k):
+        for j in range(i + 1, k):
+            if abs(r[i, j]) > 1e-15:
+                rho0 = _latent_rho(
+                    nc.dimensions[i].distribution,
+                    nc.dimensions[j].distribution,
+                    float(r[i, j]))
+                r0[i, j] = r0[j, i] = rho0
+    eig_min = np.linalg.eigvalsh((r0 + r0.T) / 2.0).min()
+    if eig_min < 1e-10:
+        r0 = _nearest_psd(r0)
+    return r0
+
+
 def _cholesky_psd(corr: np.ndarray) -> np.ndarray:
     try:
         return np.linalg.cholesky(corr)
@@ -370,15 +547,6 @@ def _cholesky_psd(corr: np.ndarray) -> np.ndarray:
         w, v = np.linalg.eigh(corr)
         w = np.clip(w, 0, None)
         return v * np.sqrt(w)[None, :]
-
-
-def _triangular_inverse(u: np.ndarray, half: float) -> np.ndarray:
-    """[-T, T] 上关于 0 对称的三角分布分位数函数。"""
-    out = np.empty_like(u)
-    left = u < 0.5
-    out[left] = -half + half * np.sqrt(2.0 * u[left])
-    out[~left] = half - half * np.sqrt(2.0 * (1.0 - u[~left]))
-    return out
 
 
 def _sampling_half_widths(nd: list[NormDimension],
@@ -419,6 +587,11 @@ def sample_dimensions(nc: NormalizedChain, n_samples: int,
 
     显式给定 σ 的均匀/三角维度，其抽样半宽由 σ 反推（√3σ / √6σ），
     使抽样方差等于 σ²，与 RSS 口径一致；否则按公差带半宽抽样。
+
+    输入相关系数 ρ 统一解释为尺寸值之间的 Pearson 相关：相关维度先将
+    用户相关矩阵逐对换算为 copula 潜变量相关（均匀/正态解析反演、
+    三角数值标定），再 Cholesky 抽样，使样本经验 Pearson 相关与
+    RSS 协方差公式中的 ρ 一致。
     """
     nd = nc.dimensions
     k = len(nd)
@@ -435,7 +608,8 @@ def sample_dimensions(nc: NormalizedChain, n_samples: int,
 
     has_corr = not np.allclose(nc.corr, np.eye(k), atol=1e-12)
     if has_corr:
-        z = rng.standard_normal((n_samples, k)) @ _cholesky_psd(nc.corr).T
+        latent = latent_correlation_matrix(nc)
+        z = rng.standard_normal((n_samples, k)) @ _cholesky_psd(latent).T
         uniforms = 0.5 * (1.0 + np.vectorize(math.erf)(
             z / math.sqrt(2.0)))
     else:
@@ -517,7 +691,9 @@ def monte_carlo(nc: NormalizedChain, n_samples: int | None = None,
             "固定种子 np.random.default_rng(seed)，结果可精确复现",
             "C^(k) = Σ s_i·X_i^(k)，k=1..N",
             "独立维度按各自分布抽样；相关维度使用 Gaussian copula",
-            "  z = L·ξ (LLᵀ=R, Cholesky)，u=Φ(z)，再代入各分布逆 CDF",
+            "  输入 ρ=尺寸值 Pearson 相关；先反演潜变量相关 ρ0（均匀-均匀"
+            " 2sin(πρ/6)、均匀-正态 ρ√(π/3)、三角配对数值标定），"
+            "再 z=L·ξ (LLᵀ=R0, Cholesky)，u=Φ(z)，代入各分布逆 CDF",
             "显式 σ：正态 center+σ·z；均匀抽样半宽 σ√3、三角 σ√6，"
             "样本方差=σ²，与 RSS 同源；未给 σ 时按公差带半宽抽样",
             "σ=0 时样本为固定间隙；超差率按固定值判定",
@@ -557,6 +733,25 @@ def _normalized_snapshot(nc: NormalizedChain) -> list[dict]:
         }
         for i, d in enumerate(nc.dimensions)
     ]
+
+
+def _correlation_trace(nc: NormalizedChain) -> dict:
+    corr_trace = {
+        "matrix": nc.corr.tolist(),
+        "dimension_order": [d.id for d in nc.dimensions],
+        "definition": "输入 ρ 为尺寸值之间的 Pearson 相关系数；"
+                      "RSS 协方差公式与蒙特卡洛抽样边缘采用同一定义",
+    }
+    if not np.allclose(nc.corr, np.eye(len(nc.dimensions)), atol=1e-12):
+        corr_trace["monte_carlo_latent_matrix"] = \
+            latent_correlation_matrix(nc).tolist()
+        corr_trace["copula_calibration"] = (
+            "Gaussian copula 潜变量正态相关已逐对反演，使抽样边缘 "
+            "Pearson 相关等于输入 ρ：正态恒等；均匀-均匀 ρ0=2sin(πρ/6)；"
+            "均匀-正态 ρ0=ρ√(π/3)；含三角分布的配对固定样本数值标定；"
+            "整体矩阵在边界情形投影到最近正定相关矩阵"
+        )
+    return corr_trace
 
 
 def compute_all(nc: NormalizedChain,
@@ -600,10 +795,7 @@ def compute_all(nc: NormalizedChain,
                           "原始名义值/偏差/标准差与单位原样保留",
             "mean_assumption": "制程中心假设位于公差带中点 N+m；"
                               "名义间隙 C0 仅由名义尺寸求和",
-            "correlation": {
-                "matrix": nc.corr.tolist(),
-                "dimension_order": [d.id for d in nc.dimensions],
-            },
+            "correlation": _correlation_trace(nc),
             "monte_carlo": {"samples": nc.mc_samples, "seed": nc.seed},
         },
     }

@@ -1,4 +1,5 @@
 """API 端到端：持久化、方案分支不覆盖基线、批量调整、成本搜索、追溯。"""
+import pytest
 
 
 def _create(client, payload):
@@ -79,7 +80,7 @@ def test_batch_adjust(client, simple_chain_payload):
     # 均匀分布 σ 随公差带理论重算的策略
     policies = {d["dimension_id"]: d["sigma_policy"]
                 for d in j["adjustment"]["dimensions"]}
-    assert policies["L2"] == "scaled"
+    assert policies["L2"] == "scaled_explicit"
 
 
 def test_batch_target_subset(client, simple_chain_payload):
@@ -119,6 +120,85 @@ def test_gap_probability_in_inches(client, simple_chain_payload):
     p_in = r.json()
     assert abs(p_in["probabilities"]["rss"]
                - p_mm["probabilities"]["rss"]) < 1e-9
+
+
+def test_explicit_std_dev_uniform_moves_mc_like_rss(client, simple_chain_payload):
+    """缺陷回归：只调低均匀尺寸的显式 σ，RSS 与 MC σ 必须同步减小。"""
+    cid = _create(client, simple_chain_payload)["chain_id"]
+    base = client.get(f"/chains/{cid}").json()["result"]["results"]
+    r = client.post(f"/chains/{cid}/scenarios", json={
+        "name": "tighter-spacer-sigma",
+        "std_dev_overrides": {"L2": 0.01},   # 原理论 σ = 0.05/√3 ≈ 0.0289
+    })
+    assert r.status_code == 201, r.text
+    sc = r.json()["result"]["results"]
+    assert sc["rss"]["sigma_mm"] < base["rss"]["sigma_mm"]
+    assert sc["monte_carlo"]["sigma_mm"] < base["monte_carlo"]["sigma_mm"]
+    # MC 与 RSS 对同一显式 σ 必须口径一致
+    assert abs(sc["monte_carlo"]["sigma_mm"] - sc["rss"]["sigma_mm"]) / \
+        sc["rss"]["sigma_mm"] < 0.02
+    # 方案上下文中的区间概率重放同样使用显式 σ
+    gp = client.post(
+        f"/chains/{cid}/gap-probability?scenario_id={r.json()['scenario_id']}",
+        json={"lower": 0.25, "upper": 0.58}).json()
+    assert gp["probabilities"]["rss"] == gp["probabilities"]["monte_carlo"] or \
+        abs(gp["probabilities"]["rss"] - gp["probabilities"]["monte_carlo"]) < 0.01
+
+
+def _zero_variance_payload():
+    return {
+        "name": "fixed-gap",
+        "closure_lower_limit": 0.1,
+        "closure_upper_limit": 0.5,
+        "dimensions": [
+            {"id": "A", "start": "a", "end": "b", "nominal": 10.2,
+             "upper_deviation": 0.0, "lower_deviation": 0.0,
+             "std_dev": 0.0, "distribution": "normal"},
+            {"id": "B", "start": "b", "end": "a", "nominal": 10.0,
+             "upper_deviation": 0.0, "lower_deviation": 0.0,
+             "std_dev": 0.0, "distribution": "normal", "direction": -1},
+        ],
+        "mc_samples": 5000,
+        "random_seed": 3,
+    }
+
+
+def test_zero_variance_chain_results(client):
+    cid = _create(client, _zero_variance_payload())["chain_id"]
+    res = client.get(f"/chains/{cid}").json()["result"]["results"]
+    assert res["rss"]["sigma_mm"] == 0.0
+    assert res["monte_carlo"]["sigma_mm"] == 0.0
+    assert res["monte_carlo"]["lower_bound_mm"] == pytest.approx(0.2, abs=1e-9)
+    assert res["monte_carlo"]["upper_bound_mm"] == pytest.approx(0.2, abs=1e-9)
+    assert res["rss"]["mean_gap_mm"] == pytest.approx(0.2, abs=1e-9)
+
+
+def test_zero_variance_gap_probability_deterministic(client):
+    """缺陷回归：σ=0 的固定间隙链查询区间概率返回确定 0/1，不再 500。"""
+    cid = _create(client, _zero_variance_payload())["chain_id"]
+    # 固定间隙 0.2 被 [0.15, 0.25] 覆盖 -> 三方法全 1
+    inside = client.post(f"/chains/{cid}/gap-probability",
+                         json={"lower": 0.15, "upper": 0.25})
+    assert inside.status_code == 200, inside.text
+    p = inside.json()["probabilities"]
+    assert p == {"rss": 1.0, "monte_carlo": 1.0, "worst_case": 1.0}
+    assert inside.json()["degenerate_fixed_gap_mm"] == pytest.approx(
+        0.2, abs=1e-9)
+    # 区间不含固定间隙 -> 0
+    outside = client.post(f"/chains/{cid}/gap-probability",
+                          json={"lower": 0.21, "upper": 0.30})
+    assert outside.status_code == 200
+    assert outside.json()["probabilities"] == {
+        "rss": 0.0, "monte_carlo": 0.0, "worst_case": 0.0}
+    # 端点闭区间：恰好等于 0.2 也算落入
+    edge = client.post(f"/chains/{cid}/gap-probability",
+                       json={"lower": 0.2, "upper": 0.2})
+    assert edge.json()["probabilities"]["rss"] == 1.0
+    assert edge.json()["probabilities"]["monte_carlo"] == 1.0
+    # 单侧无界
+    tail = client.post(f"/chains/{cid}/gap-probability",
+                       json={"lower": 0.2})
+    assert tail.json()["probabilities"]["rss"] == 1.0
 
 
 def test_cost_targets(client, simple_chain_payload):

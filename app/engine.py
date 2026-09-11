@@ -19,6 +19,12 @@
     P(超差) = Φ((LSL-μ_C)/σ_C) + 1 - Φ((USL-μ_C)/σ_C)
     组成环理论标准差：均匀 σ=T/√3，三角 σ=T/√6，正态由用户给定。
 
+显式 σ 的统一含义（RSS 与蒙特卡洛必须同源）
+    正态直接以 σ 抽样；均匀抽样半宽取 σ√3、三角取 σ√6，
+    样本方差恰为 σ²，因此蒙特卡洛 σ_C 收敛到 RSS 解析值。
+    未给显式 σ 时，均匀/三角按公差带抽样、σ 取理论值。
+    σ=0 时封闭环退化为固定间隙，区间概率取 0/1 指示值。
+
 蒙特卡洛 (MC)
     固定随机种子；独立维度直接抽样，存在相关系数时使用
     Gaussian copula（由相关矩阵 Cholesky 分解得到相关正态，
@@ -55,6 +61,9 @@ class NormDimension:
     direction: int
     original: dict                # 原始单位表示（保留）
     unit: str
+    # σ 是否由调用方显式给定：True 时蒙特卡洛按 σ 确定散布尺度，
+    # False 时 σ 由公差带理论导出、抽样覆盖整个公差带。
+    sigma_explicit: bool = False
 
     def band_bounds(self) -> tuple[float, float]:
         return self.nominal + self.lower_dev, self.nominal + self.upper_dev
@@ -125,7 +134,8 @@ def normalize_chain(chain_create) -> NormalizedChain:
         es_mm = to_mm(d.upper_deviation, u)
         ei_mm = to_mm(d.lower_deviation, u)
         t_mm = (es_mm - ei_mm) / 2.0
-        if d.std_dev is not None:
+        sigma_explicit = d.std_dev is not None
+        if sigma_explicit:
             sigma_mm = to_mm(d.std_dev, u)
         else:
             sigma_mm = _theoretical_sigma(d.distribution.value, t_mm)
@@ -139,6 +149,7 @@ def normalize_chain(chain_create) -> NormalizedChain:
                 mid=(es_mm + ei_mm) / 2.0,
                 half_width=t_mm,
                 sigma=max(sigma_mm, 0.0),
+                sigma_explicit=sigma_explicit,
                 distribution=d.distribution.value,
                 start=d.start,
                 end=d.end,
@@ -335,7 +346,8 @@ def rss_analysis(nc: NormalizedChain, z: float = Z_STAT) -> dict:
             "σ_C = sqrt(Σ_i Σ_j s_i·s_j·ρ_ij·σ_i·σ_j)",
             f"统计界限: [μ_C - {z:g}σ_C, μ_C + {z:g}σ_C]",
             "超差率 P = Φ((LSL-μ_C)/σ_C) + 1 - Φ((USL-μ_C)/σ_C)（正态近似）",
-            "组成环 σ: 均匀 T/√3，三角 T/√6，正态取用户输入",
+            "组成环 σ: 均匀 T/√3，三角 T/√6，正态取用户输入；显式 σ 与"
+            "蒙特卡洛同源（见蒙特卡洛公式）",
             "方差贡献: σ_i·s_i·Σ_j ρ_ij·s_j·σ_j；占比之和为 1",
         ],
     }
@@ -369,15 +381,44 @@ def _triangular_inverse(u: np.ndarray, half: float) -> np.ndarray:
     return out
 
 
+def _sampling_half_widths(nd: list[NormDimension],
+                          sigmas: np.ndarray,
+                          halfs: np.ndarray,
+                          explicit_flags) -> np.ndarray:
+    """各维度蒙特卡洛抽样半宽 a_j（关于中心 m 对称）。
+
+    显式 σ 对 RSS 与蒙特卡洛必须含义一致：抽样方差 = σ²。
+      uniform    U(center-a, center+a): a = σ·√3
+      triangular 峰在 center、端点 ±a:  a = σ·√6
+    未显式给 σ 时，σ 是公差带的理论值，按公差带半宽 T 抽样。
+    """
+    a = halfs.copy()
+    for j, d in enumerate(nd):
+        is_explicit = (
+            d.sigma_explicit if explicit_flags is None else bool(explicit_flags[j])
+        )
+        if not is_explicit:
+            continue
+        if d.distribution == DistributionType.UNIFORM.value:
+            a[j] = sigmas[j] * math.sqrt(3.0)
+        elif d.distribution == DistributionType.TRIANGULAR.value:
+            a[j] = sigmas[j] * math.sqrt(6.0)
+    return a
+
+
 def sample_dimensions(nc: NormalizedChain, n_samples: int,
                       seed: int, sigmas: np.ndarray | None = None,
                       mids: np.ndarray | None = None,
-                      halfs: np.ndarray | None = None) -> np.ndarray:
+                      halfs: np.ndarray | None = None,
+                      explicit_flags=None) -> np.ndarray:
     """生成 n×k 样本矩阵（每个尺寸一列，单位 mm，中心在 N+m）。
 
     独立维度按各自分布直接抽样；存在相关系数时统一使用 Gaussian copula：
     由 Cholesky 得到相关标准正态 z，正态维度直接 center+σ·z，
     均匀/三角维度经 u=Φ(z) 再代入逆 CDF。
+
+    显式给定 σ 的均匀/三角维度，其抽样半宽由 σ 反推（√3σ / √6σ），
+    使抽样方差等于 σ²，与 RSS 口径一致；否则按公差带半宽抽样。
     """
     nd = nc.dimensions
     k = len(nd)
@@ -388,6 +429,9 @@ def sample_dimensions(nc: NormalizedChain, n_samples: int,
         mids = np.array([d.mid for d in nd])
     if halfs is None:
         halfs = np.array([d.half_width for d in nd])
+    if explicit_flags is None:
+        explicit_flags = [d.sigma_explicit for d in nd]
+    sample_halfs = _sampling_half_widths(nd, sigmas, halfs, explicit_flags)
 
     has_corr = not np.allclose(nc.corr, np.eye(k), atol=1e-12)
     if has_corr:
@@ -401,15 +445,14 @@ def sample_dimensions(nc: NormalizedChain, n_samples: int,
     samples = np.zeros((n_samples, k))
     for j, d in enumerate(nd):
         center = d.nominal + mids[j]
+        a = sample_halfs[j]
         if d.distribution == DistributionType.NORMAL.value:
             samples[:, j] = center + sigmas[j] * z[:, j]
         elif d.distribution == DistributionType.UNIFORM.value:
-            samples[:, j] = (
-                center - halfs[j] + 2.0 * halfs[j] * uniforms[:, j]
-            )
+            samples[:, j] = center - a + 2.0 * a * uniforms[:, j]
         elif d.distribution == DistributionType.TRIANGULAR.value:
             samples[:, j] = center + _triangular_inverse(
-                uniforms[:, j], halfs[j])
+                uniforms[:, j], a)
         else:  # pragma: no cover - 枚举已固定
             raise ValueError(f"未知分布 {d.distribution}")
     return samples
@@ -419,12 +462,14 @@ def monte_carlo(nc: NormalizedChain, n_samples: int | None = None,
                 seed: int | None = None,
                 sigmas: np.ndarray | None = None,
                 mids: np.ndarray | None = None,
-                halfs: np.ndarray | None = None) -> dict:
+                halfs: np.ndarray | None = None,
+                explicit_flags=None) -> dict:
     n_samples = n_samples or nc.mc_samples
     seed = nc.seed if seed is None else seed
     nd = nc.dimensions
     x = sample_dimensions(
-        nc, n_samples, seed, sigmas=sigmas, mids=mids, halfs=halfs
+        nc, n_samples, seed, sigmas=sigmas, mids=mids, halfs=halfs,
+        explicit_flags=explicit_flags,
     )
     s = _s_arr(nd)
     closure = x @ s
@@ -473,6 +518,9 @@ def monte_carlo(nc: NormalizedChain, n_samples: int | None = None,
             "C^(k) = Σ s_i·X_i^(k)，k=1..N",
             "独立维度按各自分布抽样；相关维度使用 Gaussian copula",
             "  z = L·ξ (LLᵀ=R, Cholesky)，u=Φ(z)，再代入各分布逆 CDF",
+            "显式 σ：正态 center+σ·z；均匀抽样半宽 σ√3、三角 σ√6，"
+            "样本方差=σ²，与 RSS 同源；未给 σ 时按公差带半宽抽样",
+            "σ=0 时样本为固定间隙；超差率按固定值判定",
             "超差率 = #{C<LSL 或 C>USL} / N",
             "敏感度: 协方差法 slope_i=Cov(X_i,C)/Var(C)，方差贡献 s_i·Cov",
             "报告界为样本 0.5%/99.5% 分位数，另附样本最小值/最大值",
@@ -483,6 +531,11 @@ def monte_carlo(nc: NormalizedChain, n_samples: int | None = None,
 # ----------------------------------------------------------- 结果总装
 
 def _normalized_snapshot(nc: NormalizedChain) -> list[dict]:
+    sigmas = _sigma_arr(nc.dimensions)
+    halfs = np.array([d.half_width for d in nc.dimensions])
+    sample_halfs = _sampling_half_widths(
+        nc.dimensions, sigmas, halfs,
+        [d.sigma_explicit for d in nc.dimensions])
     return [
         {
             "dimension_id": d.id,
@@ -490,6 +543,7 @@ def _normalized_snapshot(nc: NormalizedChain) -> list[dict]:
             "sign": d.sign,
             "measurement_direction": d.direction,
             "distribution": d.distribution,
+            "sigma_explicit": d.sigma_explicit,
             "normalized_mm": {
                 "nominal": d.nominal,
                 "upper_deviation": d.upper_dev,
@@ -497,10 +551,11 @@ def _normalized_snapshot(nc: NormalizedChain) -> list[dict]:
                 "mid_shift": d.mid,
                 "half_width": d.half_width,
                 "sigma": d.sigma,
+                "monte_carlo_sampling_half_width": float(sample_halfs[i]),
             },
             "original_representation": d.original,
         }
-        for d in nc.dimensions
+        for i, d in enumerate(nc.dimensions)
     ]
 
 
@@ -508,20 +563,25 @@ def compute_all(nc: NormalizedChain,
                 sigmas: np.ndarray | None = None,
                 mids: np.ndarray | None = None,
                 halfs: np.ndarray | None = None,
-                seed: int | None = None) -> dict:
-    """计算三种方法；sigmas/mids/halfs 供方案分支覆盖。"""
+                seed: int | None = None,
+                explicit_flags=None) -> dict:
+    """计算三种方法；sigmas/mids/halfs/explicit_flags 供方案分支覆盖。"""
     if sigmas is not None or mids is not None or halfs is not None:
         # 用覆盖参数做一个轻量副本（MC / RSS），WC 同步反映新公差带
         nd = nc.dimensions
         sigmas = _sigma_arr(nd) if sigmas is None else sigmas
         mids = np.array([d.mid for d in nd]) if mids is None else mids
         halfs = np.array([d.half_width for d in nd]) if halfs is None else halfs
-        override_nc = _override_chain(nc, sigmas, mids, halfs)
+        override_nc = _override_chain(
+            nc, sigmas, mids, halfs, explicit_flags=explicit_flags)
         wc = worst_case(override_nc)
         rss = rss_analysis(override_nc)
         mc = monte_carlo(
             override_nc, seed=seed,
             sigmas=sigmas, mids=mids, halfs=halfs,
+            explicit_flags=(
+                [d.sigma_explicit for d in override_nc.dimensions]
+                if explicit_flags is None else explicit_flags),
         )
     else:
         wc = worst_case(nc)
@@ -550,9 +610,15 @@ def compute_all(nc: NormalizedChain,
 
 
 def _override_chain(nc: NormalizedChain, sigmas: np.ndarray,
-                    mids: np.ndarray, halfs: np.ndarray) -> NormalizedChain:
+                    mids: np.ndarray, halfs: np.ndarray,
+                    explicit_flags=None) -> NormalizedChain:
     new_dims: list[NormDimension] = []
-    for d, sigma, mid, half in zip(nc.dimensions, sigmas, mids, halfs):
+    for j, (d, sigma, mid, half) in enumerate(
+            zip(nc.dimensions, sigmas, mids, halfs)):
+        flag = (
+            d.sigma_explicit if explicit_flags is None
+            else bool(explicit_flags[j])
+        )
         new_dims.append(NormDimension(
             id=d.id, sign=d.sign, nominal=d.nominal,
             upper_dev=mid + half, lower_dev=mid - half,
@@ -560,6 +626,7 @@ def _override_chain(nc: NormalizedChain, sigmas: np.ndarray,
             sigma=float(sigma), distribution=d.distribution,
             start=d.start, end=d.end, direction=d.direction,
             original=d.original, unit=d.unit,
+            sigma_explicit=flag,
         ))
     return NormalizedChain(
         dimensions=new_dims,
@@ -574,7 +641,9 @@ def _override_chain(nc: NormalizedChain, sigmas: np.ndarray,
 # --------------------------------------------------------- 区间概率
 
 def closure_samples(nc: NormalizedChain, result: dict | None = None,
-                    seed: int | None = None) -> np.ndarray:
+                    seed: int | None = None,
+                    sigmas=None, mids=None, halfs=None,
+                    explicit_flags=None) -> np.ndarray:
     """按 result 记录的种子/样本量（或指定种子）重放封闭环样本。"""
     if result is not None:
         mc = result["results"]["monte_carlo"]
@@ -583,30 +652,66 @@ def closure_samples(nc: NormalizedChain, result: dict | None = None,
         n_samples, used_seed = nc.mc_samples, nc.seed
     if seed is not None:
         used_seed = seed
-    x = sample_dimensions(nc, n_samples, used_seed)
+    x = sample_dimensions(
+        nc, n_samples, used_seed,
+        sigmas=sigmas, mids=mids, halfs=halfs,
+        explicit_flags=explicit_flags,
+    )
     return x @ _s_arr(nc.dimensions)
+
+
+def _interval_indicator(value: float, low: float | None,
+                        high: float | None) -> float:
+    scale = max(1.0, abs(value))
+    if low is not None:
+        scale = max(scale, abs(low))
+    if high is not None:
+        scale = max(scale, abs(high))
+    eps = 1e-9 * scale  # 单位换算/求和浮点容差
+    if low is not None and value < low - eps:
+        return 0.0
+    if high is not None and value > high + eps:
+        return 0.0
+    return 1.0
 
 
 def gap_probability(nc: NormalizedChain, result: dict,
                     low_mm: float | None, high_mm: float | None,
-                    closure: np.ndarray | None = None) -> dict:
-    """三种方法下封闭环落在 [low, high] 的概率（WC 为确定性 0/1）。"""
+                    closure: np.ndarray | None = None,
+                    sigmas=None, mids=None, halfs=None,
+                    explicit_flags=None) -> dict:
+    """三种方法下封闭环落在 [low, high] 的概率（WC 为确定性 0/1）。
+
+    零方差链（σ_C=0）的封闭环为固定间隙 μ_C：RSS 与蒙特卡洛均退化为
+    指示函数——固定间隙落在查询闭区间内返回 1，否则 0。
+    """
     mu = result["results"]["rss"]["mean_gap_mm"]
     sigma = result["results"]["rss"]["sigma_mm"]
-    upper_p = 1.0 if high_mm is None else float(
-        normal_cdf((high_mm - mu) / sigma))
-    lower_p = 0.0 if low_mm is None else float(
-        normal_cdf((low_mm - mu) / sigma))
-    rss_p = max(0.0, upper_p - lower_p)
+    if sigma <= 0:
+        rss_p = _interval_indicator(mu, low_mm, high_mm)
+        deterministic = True
+    else:
+        upper_p = 1.0 if high_mm is None else float(
+            normal_cdf((high_mm - mu) / sigma))
+        lower_p = 0.0 if low_mm is None else float(
+            normal_cdf((low_mm - mu) / sigma))
+        rss_p = max(0.0, upper_p - lower_p)
+        deterministic = False
 
     if closure is None:
-        closure = closure_samples(nc, result)
-    mask = np.ones_like(closure, dtype=bool)
-    if low_mm is not None:
-        mask &= closure >= low_mm
-    if high_mm is not None:
-        mask &= closure <= high_mm
-    mc_p = float(mask.mean())
+        closure = closure_samples(
+            nc, result, sigmas=sigmas, mids=mids, halfs=halfs,
+            explicit_flags=explicit_flags)
+    if float(np.asarray(closure).std(ddof=1)) <= 0:
+        mc_p = _interval_indicator(float(np.asarray(closure)[0]),
+                                   low_mm, high_mm)
+    else:
+        mask = np.ones_like(closure, dtype=bool)
+        if low_mm is not None:
+            mask &= closure >= low_mm
+        if high_mm is not None:
+            mask &= closure <= high_mm
+        mc_p = float(mask.mean())
 
     wcl = result["results"]["worst_case"]["lower_bound_mm"]
     wcu = result["results"]["worst_case"]["upper_bound_mm"]
@@ -620,9 +725,12 @@ def gap_probability(nc: NormalizedChain, result: dict,
             "monte_carlo": mc_p,
             "worst_case": 1.0 if contained else 0.0,
         },
+        "degenerate_fixed_gap_mm": mu if deterministic else None,
         "formulas": [
-            "RSS: P = Φ((b-μ_C)/σ_C) - Φ((a-μ_C)/σ_C)",
-            "MC: P = #{a ≤ C ≤ b} / N（固定种子经验频率）",
+            "RSS: P = Φ((b-μ_C)/σ_C) - Φ((a-μ_C)/σ_C)；σ_C=0 时退化为"
+            "固定间隙 μ_C 是否落在 [a,b] 的指示函数（0/1）",
+            "MC: P = #{a ≤ C ≤ b} / N（固定种子经验频率）；样本无方差时"
+            "同样按固定间隙判定 0/1",
             "WC: 确定性区间 [μ_C-ΣT, μ_C+ΣT] 完全落入请求区间记 1，否则 0",
         ],
         "worst_case_note": "极值法不含概率分布，0/1 表示确定性区间是否被覆盖",

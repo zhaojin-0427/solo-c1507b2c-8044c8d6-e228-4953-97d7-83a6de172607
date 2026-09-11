@@ -106,6 +106,9 @@ def search_cost_targets(nc: NormalizedChain, request) -> dict:
         candidates.sort(key=lambda st: st["cost"])
         beam = candidates[:beam_width]
 
+    # 优化器语义：候选组合中均匀/三角的 σ 由收紧后的公差带理论决定，
+    # 正态保留用户 σ；显式标志据此设置，保证 RSS 与 MC 口径一致。
+    candidate_explicit = [d.distribution == "normal" for d in dims]
     feasible = []
     seen = set()
     eval_count = 0
@@ -115,7 +118,8 @@ def search_cost_targets(nc: NormalizedChain, request) -> dict:
         eval_count += 1
         halfs = np.array(state["halfs"])
         sigmas = np.array(state["sigmas"])
-        ov = _override_chain(nc, sigmas, mids, halfs)
+        ov = _override_chain(nc, sigmas, mids, halfs,
+                             explicit_flags=candidate_explicit)
         rss_rej = _rss_reject(ov, sigmas)
         key = tuple(round(v, 12) for v in state["levels"])
         if rss_rej is None:
@@ -132,7 +136,9 @@ def search_cost_targets(nc: NormalizedChain, request) -> dict:
     seed = nc.seed if request.random_seed is None else request.random_seed
     verified = []
     for state, ov, sigmas, halfs, rss_rej in feasible:
-        mc = monte_carlo(ov, seed=seed, sigmas=sigmas, mids=mids, halfs=halfs)
+        mc = monte_carlo(ov, seed=seed, sigmas=sigmas, mids=mids, halfs=halfs,
+                         explicit_flags=[d.distribution == "normal"
+                                         for d in dims])
         mc_rej = mc["reject_probability"]
         if mc_rej is not None and mc_rej <= target:
             wc = worst_case(ov)

@@ -27,16 +27,19 @@ def _id_index(nc: NormalizedChain) -> dict[str, int]:
 
 
 def apply_scenario_overrides(nc: NormalizedChain, payload) -> tuple:
-    """返回 (override_nc, sigmas, mids, halfs, overrides_record)。
+    """返回 (override_nc, sigmas, mids, halfs, explicit_flags, record)。
 
     tolerance_overrides 以该尺寸的原始单位给出，内部换算为 mm；
-    std_dev_overrides 同理（null = 非正态时回到理论标准差，
-    正态显式 null 不允许，由 schema 流程保证正态基线必有 σ）。
+    std_dev_overrides 同理。显式给出（含 0）的 σ 同时驱动 RSS 与蒙特卡洛：
+      * normal: 直接作为抽样 σ；
+      * uniform/triangular: 抽样半宽反推为 σ√3 / σ√6，样本方差 = σ²；
+      * uniform/triangular 置空: σ 回落到公差带理论值，按公差带抽样。
     """
     idx = _id_index(nc)
     halfs = np.array([d.half_width for d in nc.dimensions])
     mids = np.array([d.mid for d in nc.dimensions])
     sigmas = _sigma_arr(nc.dimensions)
+    explicit = [d.sigma_explicit for d in nc.dimensions]
     record: dict[str, dict] = {}
 
     for dim_id, ov in payload.tolerance_overrides.items():
@@ -48,6 +51,9 @@ def apply_scenario_overrides(nc: NormalizedChain, payload) -> tuple:
         ei = to_mm(ov.lower_deviation, unit)
         mids[i] = (es + ei) / 2.0
         halfs[i] = (es - ei) / 2.0
+        # 仅改公差带：非显式 σ 维度的理论 σ 随新公差带重算
+        if not explicit[i]:
+            sigmas[i] = _theoretical(nc.dimensions[i].distribution, halfs[i])
         record.setdefault(dim_id, {})["tolerance"] = {
             "upper_deviation": ov.upper_deviation,
             "lower_deviation": ov.lower_deviation,
@@ -72,16 +78,19 @@ def apply_scenario_overrides(nc: NormalizedChain, payload) -> tuple:
                     f"尺寸 {dim_id}: 正态分布不能将标准差置空"
                 )
             sigmas[i] = _theoretical(d.distribution, halfs[i])
+            explicit[i] = False
         else:
             sigmas[i] = to_mm(std, unit)
+            explicit[i] = True
         record.setdefault(dim_id, {})["std_dev"] = {
             "std_dev": std,
             "unit": unit,
+            "explicit": explicit[i],
             "normalized_mm": {"sigma": sigmas[i]},
         }
 
-    ov_nc = _override_chain(nc, sigmas, mids, halfs)
-    return ov_nc, sigmas, mids, halfs, record
+    ov_nc = _override_chain(nc, sigmas, mids, halfs, explicit_flags=explicit)
+    return ov_nc, sigmas, mids, halfs, explicit, record
 
 
 def _theoretical(distribution: str, half: float) -> float:
@@ -107,6 +116,7 @@ def apply_batch_adjust(nc: NormalizedChain, payload) -> tuple:
     mids = np.array([d.mid for d in nc.dimensions])
     halfs = halfs0.copy()
     sigmas = _sigma_arr(nc.dimensions)
+    explicit = [d.sigma_explicit for d in nc.dimensions]
     record = {"dimensions": [], "tolerance_scale": payload.tolerance_scale}
 
     for i, d in enumerate(nc.dimensions):
@@ -114,25 +124,31 @@ def apply_batch_adjust(nc: NormalizedChain, payload) -> tuple:
             continue
         halfs[i] = halfs0[i] * payload.tolerance_scale
         if payload.std_dev_scale is not None:
+            # 显式要求 σ 缩放：缩放值同时作为显式 σ 驱动 MC
             sigmas[i] = sigmas[i] * payload.std_dev_scale
-        elif d.distribution != "normal":
+            explicit[i] = True
+            policy = "scaled_explicit"
+        elif d.distribution != "normal" and not d.sigma_explicit:
             sigmas[i] = _theoretical(d.distribution, halfs[i])
-        # 正态且未指定 std_dev_scale：保留用户 σ（结果中明确注明）
+            policy = "theoretical"
+        elif d.distribution != "normal" and d.sigma_explicit:
+            # 有界分布的显式 σ 不随公差带变化，MC 仍按该 σ 抽样
+            policy = "explicit_sigma_kept"
+        else:
+            # 正态且未指定 std_dev_scale：保留用户 σ（结果中明确注明）
+            policy = "kept_user_value"
         record["dimensions"].append({
             "dimension_id": d.id,
             "old_half_width_mm": float(halfs0[i]),
             "new_half_width_mm": float(halfs[i]),
             "new_sigma_mm": float(sigmas[i]),
+            "sigma_explicit": bool(explicit[i]),
             "distribution": d.distribution,
-            "sigma_policy": (
-                "scaled" if payload.std_dev_scale is not None
-                else "theoretical" if d.distribution != "normal"
-                else "kept_user_value"
-            ),
+            "sigma_policy": policy,
         })
 
-    ov_nc = _override_chain(nc, sigmas, mids, halfs)
-    return ov_nc, sigmas, mids, halfs, record
+    ov_nc = _override_chain(nc, sigmas, mids, halfs, explicit_flags=explicit)
+    return ov_nc, sigmas, mids, halfs, explicit, record
 
 
 def run_scenario(nc: NormalizedChain, sigmas, mids, halfs,

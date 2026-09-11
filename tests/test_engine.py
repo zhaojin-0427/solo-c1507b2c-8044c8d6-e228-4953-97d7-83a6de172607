@@ -128,6 +128,62 @@ def test_gap_probability_methods():
     assert ans2["probabilities"]["rss"] < ans["probabilities"]["rss"]
 
 
+def test_explicit_sigma_uniform_sampling_variance():
+    """显式 σ 的均匀/三角维度，蒙特卡洛抽样方差必须等于 σ²（与 RSS 同口径）。"""
+    from app.engine import sample_dimensions
+
+    chain = ChainCreate.model_validate({
+        "name": "explicit-sigma",
+        "dimensions": [
+            # 显式 σ 远小于公差带理论值
+            {"id": "U", "start": "a", "end": "b", "nominal": 10,
+             "upper_deviation": 0.2, "lower_deviation": -0.2,
+             "distribution": "uniform", "std_dev": 0.05},
+            {"id": "T", "start": "b", "end": "a", "nominal": 10,
+             "upper_deviation": 0.2, "lower_deviation": -0.2,
+             "distribution": "triangular", "std_dev": 0.03, "direction": -1},
+        ],
+        "mc_samples": 400000,
+    })
+    nc = normalize_chain(chain)
+    assert nc.dimensions[0].sigma_explicit is True
+    x = sample_dimensions(nc, 400_000, 99)
+    # 样本标准差 ≈ 显式 σ，而非公差带理论 σ
+    assert abs(float(x[:, 0].std(ddof=1)) - 0.05) < 2e-3
+    assert abs(float(x[:, 1].std(ddof=1)) - 0.03) < 1.5e-3
+    # 显式 σ=0.05 -> 抽样半宽 σ√3≈0.0866 < 公差带半宽 0.2：
+    # 样本严格落在公差带内部，且散布由 σ（而非公差带）决定
+    assert float(x[:, 0].max()) < 10.2 - 1e-9
+    assert float(x[:, 0].min()) > 9.8 + 1e-9
+    assert abs(float(x[:, 0].max()) - (10 + 0.05 * math.sqrt(3))) < 2e-3
+    res = compute_all(nc)["results"]
+    # 封闭环 σ 与 MC σ 一致
+    assert abs(res["rss"]["sigma_mm"] - res["monte_carlo"]["sigma_mm"]) / \
+        res["rss"]["sigma_mm"] < 0.02
+
+
+def test_zero_variance_gap_probability_engine():
+    nc = normalize_chain(_make(BASE, lsl=-10, usl=10))
+    # 全部 σ 置零
+    import numpy as np
+    zero = np.zeros(len(nc.dimensions))
+    mids = np.array([d.mid for d in nc.dimensions])
+    halfs = np.array([d.half_width for d in nc.dimensions])
+    from app.engine import _override_chain, gap_probability
+    ov = _override_chain(nc, zero, mids, halfs,
+                         explicit_flags=[True] * len(zero))
+    result = compute_all(ov, sigmas=zero, mids=mids, halfs=halfs,
+                         explicit_flags=[True] * len(zero))
+    assert result["results"]["rss"]["sigma_mm"] == 0.0
+    mu = result["results"]["rss"]["mean_gap_mm"]
+    inside = gap_probability(ov, result, mu - 0.01, mu + 0.01)
+    assert inside["probabilities"]["rss"] == 1.0
+    assert inside["probabilities"]["monte_carlo"] == 1.0
+    outside = gap_probability(ov, result, mu + 1.0, mu + 2.0)
+    assert outside["probabilities"]["rss"] == 0.0
+    assert outside["probabilities"]["monte_carlo"] == 0.0
+
+
 def test_distribution_theoretical_sigmas():
     chain = ChainCreate.model_validate({
         "name": "t",

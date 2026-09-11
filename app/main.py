@@ -149,25 +149,35 @@ def chain_traceability(chain_id: int) -> dict:
 # ------------------------------------------------------------ 区间概率
 
 def _resolve_context(chain_id: int, scenario_id: int | None):
-    """返回 (row/None, nc, result)；scenario_id 给定时使用方案结果。"""
+    """返回 (sc_row|None, nc, result, replay_kwargs)。
+
+    方案上下文用保存的覆盖参数（含 sigma_explicit 标志）重放抽样，
+    保证区间概率的蒙特卡洛与方案结果完全同源。
+    """
     row = _load_chain(chain_id)
     if scenario_id is None:
         nc = rebuild_normalized(row.request_json)
-        return None, nc, row.result_json
+        return None, nc, row.result_json, {}
     sc_row = db.get_scenario(scenario_id)
     if sc_row is None or sc_row.chain_id != chain_id:
         raise HTTPException(
             status_code=404,
             detail=f"链 {chain_id} 下方案 {scenario_id} 不存在",
         )
-    # 方案区间概率：以方案保存的覆盖参数重放
     nc = rebuild_normalized(row.request_json)
     ov = sc_row.overrides_json
     sigmas = np.array(ov["_resolved_sigmas_mm"], dtype=float)
     mids = np.array(ov["_resolved_mids_mm"], dtype=float)
     halfs = np.array(ov["_resolved_halfs_mm"], dtype=float)
-    nc = _override_chain(nc, sigmas, mids, halfs)
-    return sc_row, nc, sc_row.result_json
+    stored_flags = ov.get("_resolved_explicit")
+    explicit = (
+        [d.sigma_explicit for d in nc.dimensions]
+        if stored_flags is None else [bool(x) for x in stored_flags]
+    )
+    nc = _override_chain(nc, sigmas, mids, halfs, explicit_flags=explicit)
+    replay = {"sigmas": sigmas, "mids": mids, "halfs": halfs,
+              "explicit_flags": explicit}
+    return sc_row, nc, sc_row.result_json, replay
 
 
 @app.post("/chains/{chain_id}/gap-probability", tags=["chains"])
@@ -176,13 +186,14 @@ def gap_probability_endpoint(
     scenario_id: int | None = None,
 ) -> dict:
     """查询封闭环落在指定装配间隙区间的概率（三方法）。"""
-    _, nc, result = _resolve_context(chain_id, scenario_id)
+    _, nc, result, replay = _resolve_context(chain_id, scenario_id)
     low_mm = None if payload.lower is None else to_mm(payload.lower,
                                                       payload.unit.value)
     high_mm = None if payload.upper is None else to_mm(payload.upper,
                                                        payload.unit.value)
-    closure = closure_samples(nc, result)
-    answer = gap_probability(nc, result, low_mm, high_mm, closure=closure)
+    closure = closure_samples(nc, result, **replay)
+    answer = gap_probability(nc, result, low_mm, high_mm, closure=closure,
+                             **replay)
     answer["query"] = {
         "submitted": {"lower": payload.lower, "upper": payload.upper,
                       "unit": payload.unit.value},
@@ -200,7 +211,7 @@ def create_scenario(chain_id: int, payload: ScenarioCreate) -> dict:
     row = _load_chain(chain_id)
     nc = rebuild_normalized(row.request_json)
     try:
-        ov_nc, sigmas, mids, halfs, record = apply_scenario_overrides(
+        ov_nc, sigmas, mids, halfs, explicit, record = apply_scenario_overrides(
             nc, payload
         )
     except (KeyError, ValueError) as exc:
@@ -208,13 +219,14 @@ def create_scenario(chain_id: int, payload: ScenarioCreate) -> dict:
 
     result = compute_all(
         ov_nc, sigmas=sigmas, mids=mids, halfs=halfs,
-        seed=payload.random_seed,
+        seed=payload.random_seed, explicit_flags=explicit,
     )
     overrides_store: dict[str, Any] = {
         "human": record,
         "_resolved_sigmas_mm": [float(x) for x in sigmas],
         "_resolved_mids_mm": [float(x) for x in mids],
         "_resolved_halfs_mm": [float(x) for x in halfs],
+        "_resolved_explicit": [bool(x) for x in explicit],
         "random_seed": payload.random_seed,
     }
     scenario_id = db.save_scenario(
@@ -238,19 +250,21 @@ def batch_adjust(chain_id: int, payload: BatchAdjustRequest) -> dict:
     row = _load_chain(chain_id)
     nc = rebuild_normalized(row.request_json)
     try:
-        ov_nc, sigmas, mids, halfs, record = apply_batch_adjust(nc, payload)
+        ov_nc, sigmas, mids, halfs, explicit, record = apply_batch_adjust(
+            nc, payload)
     except KeyError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     result = compute_all(
         ov_nc, sigmas=sigmas, mids=mids, halfs=halfs,
-        seed=payload.random_seed,
+        seed=payload.random_seed, explicit_flags=explicit,
     )
     overrides_store = {
         "human": record,
         "_resolved_sigmas_mm": [float(x) for x in sigmas],
         "_resolved_mids_mm": [float(x) for x in mids],
         "_resolved_halfs_mm": [float(x) for x in halfs],
+        "_resolved_explicit": [bool(x) for x in explicit],
         "random_seed": payload.random_seed,
     }
     scenario_id = db.save_scenario(

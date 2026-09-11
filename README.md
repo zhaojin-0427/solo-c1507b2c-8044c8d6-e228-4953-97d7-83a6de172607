@@ -81,6 +81,9 @@ python3 -m venv --without-pip .venv        # 若 venv 自带 pip 可省略 get-p
 | POST | `/chains/{id}/batch-adjust` | 批量缩放公差带（可缩放 σ），存为分支并对比 |
 | GET | `/chains/{id}/scenarios` / `/scenarios/{sid}` | 分支列表 / 详情 |
 | POST | `/chains/{id}/cost-targets` | 按单位收紧成本搜索达到目标超差率的候选组合 |
+| POST | `/chains/{id}/inspection-batches` | 提交来料检验批次（IQC）：实测行复核基线，落库即冻结 |
+| GET | `/chains/{id}/inspection-batches` | 该链下的检验批次列表 |
+| GET | `/inspection-batches/{bid}` | 读取冻结批次（报告创建时固化，多次读取不变） |
 
 ## 典型流程
 
@@ -119,6 +122,64 @@ beam search（含 0.8 安全裕量）做低成本初筛，再用**固定种子�
   （σ 代表来料实测波动）。
 * `scale_normal_sigma=true` 表示假设采购更紧公差的同时制程能力同步提升，
   正态 σ 等比缩放。
+
+## 来料检验批次（基线复核）
+
+检验批次把**实测数据**与已入库的基线链对照（示例：
+`examples/inspection_batch.json`）：
+
+```bash
+# 基线必须先创建；批次提交到具体链下
+curl -s -X POST localhost:8000/chains -H 'Content-Type: application/json' \
+  -d @examples/chain.json
+curl -s -X POST localhost:8000/chains/1/inspection-batches \
+  -H 'Content-Type: application/json' -d @examples/inspection_batch.json
+```
+
+每行以工件序号（`serial`）关联各尺寸的实测值与单位，单位可逐行混用
+（内部换算为 mm）。**链外尺寸、重复工件序号、NaN/±Infinity、未知单位、
+同一行内重复测量同一尺寸一律拒收（422）**；空批次同样拒收。缺测可入库：
+省略该测量，或显式给 `"value": null`，响应 `report.gaps` 按工件列出缺口。
+
+批次落库后即**冻结**（`frozen: true`）：统计报告在创建时一次性算好存库，
+后续测量请另建批次，既有批次多次 GET 内容不变。
+
+### 逐尺寸结果（`report.dimension_results[]`）
+
+规格限取基线尺寸 `LSL_i=N_i+EI_i`、`USL_i=N_i+ES_i`，带中心
+`C_i=N_i+(ES_i+EI_i)/2`，同时给出 mm 与尺寸原单位两套数值：
+
+* **均值偏移**：`Δ_i = x̄_i − C_i`（另给相对名义值的偏移 `x̄−N`）；
+* **样本标准差**：`s_i = √(Σ(x−x̄)²/(n−1))`，n<2 不给；
+* **超差标记**：`x < LSL` 或 `x > USL`（边界合格），附超差工件序号、
+  数值、提交单位与越界方向；
+* **Cp / Cpk 及各自的 95% 置信区间**：
+  * Cp 区间用 `(n−1)s²/σ² ~ χ²(n−1)`：
+    `[Cp·√(χ²₀.₀₂₅/ν), Cp·√(χ²₀.₉₇₅/ν)]`，ν=n−1；
+  * Cpk 区间用 Bissell 正态近似
+    `Cpk ± 1.96·√((1+9Cpk²)/(9n)+1/(2(n−1)))`；
+  * 样本不足明示：n=0 不给任何统计量；n=1 仅给均值；n<30 逐尺寸警告；
+    s=0、规格宽度 0、Cpk 区间下限为负等情形分别在 `capability_note` 说明。
+
+### 协方差与封闭环 bootstrap
+
+只有**所有尺寸齐全的工件行**（complete cases）参与：协方差矩阵
+`Σ=(X−x̄)ᵀ(X−x̄)/(n−1)` 与相关矩阵均按完整行计算，缺测行列入
+`excluded_serials` 并注明剔除原因；每个尺寸自身的均值/标准差仍用该尺寸
+的全部实测值（可用即计）。
+
+封闭环对完整行计算 `C=Σs_i·X_i`，再用**固定随机种子**做非参数 bootstrap
+（默认 `np.random.default_rng(20260911)`，B=10 000，可在批次上指定）：
+返回 bootstrap 均值及其 95% CI、0.5%/99.5% 上下分位点、超规格比例
+`#{C<LSL 或 C>USL}/n` 及该比例的 95% CI（percentile bootstrap）。
+链未声明封闭环规格时超规格比例为 null。**完整配对不足（<2 行测齐全部
+尺寸）时不估协方差、不做封闭环分析**，`closure_analysis` 为 null，
+`closure_unavailable_reason` 解释原因（含被剔除序号），只返回单尺寸结果。
+
+`baseline_comparison.methods` 把实测 bootstrap 与基线 **RSS / 固定种子
+蒙特卡洛 / 极值法**并列，注明各自样本数（MC 样本数、完整工件行数、
+逐尺寸样本数）、剔除原因与公式；`interpretation_note` 说明实测经验比例
+与基线模型概率口径不同，不可直接等同。
 
 ## 校验拒绝（HTTP 422）
 

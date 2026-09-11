@@ -66,6 +66,28 @@ class ScenarioRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+class InspectionBatchRow(Base):
+    """来料检验批次：创建后即冻结，只允许读取。"""
+
+    __tablename__ = "inspection_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(
+        ForeignKey("chains.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    # 提交的原始测量行（值 + 单位 + 缺测标记）
+    rows_json: Mapped[list] = mapped_column(JSON)
+    # 创建时一次性算好的统计报告，保证多次读取内容不变
+    report_json: Mapped[dict] = mapped_column(JSON)
+    comparison_json: Mapped[dict] = mapped_column(JSON)
+    bootstrap_samples: Mapped[int] = mapped_column(Integer)
+    random_seed: Mapped[int] = mapped_column(Integer)
+    frozen: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 _engine: Any = None
 
 
@@ -163,6 +185,54 @@ def list_scenarios(chain_id: int) -> list[dict]:
                 "name": r.name,
                 "note": r.note,
                 "overrides": r.overrides_json,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+# ------------------------------------------------------- 来料检验批次 CRUD
+
+def save_inspection_batch(chain_id: int, name: str, note: str,
+                          rows: list[dict], report: dict, comparison: dict,
+                          bootstrap_samples: int, seed: int) -> int:
+    with session_factory() as s:
+        row = InspectionBatchRow(
+            chain_id=chain_id, name=name, note=note,
+            rows_json=rows, report_json=report, comparison_json=comparison,
+            bootstrap_samples=bootstrap_samples, random_seed=seed, frozen=1,
+        )
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def get_inspection_batch(batch_id: int) -> InspectionBatchRow | None:
+    with session_factory() as s:
+        row = s.get(InspectionBatchRow, batch_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_inspection_batches(chain_id: int) -> list[dict]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(InspectionBatchRow)
+            .where(InspectionBatchRow.chain_id == chain_id)
+            .order_by(InspectionBatchRow.id)
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "chain_id": r.chain_id,
+                "name": r.name,
+                "note": r.note,
+                "bootstrap_samples": r.bootstrap_samples,
+                "random_seed": r.random_seed,
+                "frozen": bool(r.frozen),
+                "rows_total": len(r.rows_json),
+                "complete_rows": r.report_json["sample_summary"]["complete_rows"],
                 "created_at": r.created_at.isoformat(),
             }
             for r in rows

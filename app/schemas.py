@@ -11,6 +11,8 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
+import math
+
 from pydantic import BaseModel, Field, model_validator
 
 from .units import LengthUnit
@@ -306,3 +308,62 @@ class CostTargetRequest(BaseModel):
 
 
 ScenarioCreate.model_rebuild()
+
+
+# -------------------------------------------------------- 来料检验批次
+
+class MeasurementInput(BaseModel):
+    """单条工件行中某一个尺寸的实测值。
+
+    value 必须为有限数（NaN / ±Infinity 一律拒收）；缺测用 null 表示，
+    或直接在 measurements 中省略该尺寸。
+    """
+
+    dimension_id: str = Field(..., min_length=1)
+    value: float | None = Field(
+        ..., description="实测值；null 表示该尺寸缺测（可入库）"
+    )
+    unit: LengthUnit = Field(..., description="实测值单位，须为已知长度单位")
+
+    @model_validator(mode="after")
+    def _finite(self) -> "MeasurementInput":
+        # Pydantic 接受 NaN/Infinity 为 float，这里显式拒绝
+        if self.value is not None and not math.isfinite(self.value):
+            raise ValueError(
+                f"尺寸 {self.dimension_id} 实测值必须为有限数，"
+                f"收到 {self.value!r}；缺测请用 null"
+            )
+        return self
+
+
+class BatchRowInput(BaseModel):
+    """一个工件序号及其各尺寸实测值（每行内同一尺寸只能出现一次）。"""
+
+    serial: str = Field(..., min_length=1, description="工件序号")
+    measurements: list[MeasurementInput] = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def _no_duplicate_dimension(self) -> "BatchRowInput":
+        ids = [m.dimension_id for m in self.measurements]
+        dup = sorted({i for i in ids if ids.count(i) > 1})
+        if dup:
+            raise ValueError(
+                f"工件 {self.serial}: 同一尺寸重复测量 {dup}，每行每尺寸只允许一条"
+            )
+        return self
+
+
+class InspectionBatchCreate(BaseModel):
+    """创建来料检验批次：选定基线链，逐工件行提交实测值。"""
+
+    name: str = Field(..., min_length=1)
+    note: str = ""
+    rows: list[BatchRowInput] = Field(..., min_length=1)
+    # 封闭环 bootstrap 重采样（固定随机种子，结果可复现）
+    bootstrap_samples: int = Field(
+        10_000, ge=1_000, le=200_000,
+        description="封闭环分布 bootstrap 重采样次数 B",
+    )
+    random_seed: int = Field(
+        20260911, ge=0, description="bootstrap 固定随机种子"
+    )

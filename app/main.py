@@ -7,11 +7,13 @@
 """
 from __future__ import annotations
 
+import math
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse
 
 import numpy as np
 
@@ -23,6 +25,7 @@ from .engine import (
     gap_probability,
     normalize_chain,
 )
+from .inspection import analyze_batch, baseline_comparison, validate_rows
 from .optimizer import search_cost_targets
 from .scenarios import (
     apply_batch_adjust,
@@ -35,6 +38,7 @@ from .schemas import (
     ChainCreate,
     CostTargetRequest,
     GapProbabilityRequest,
+    InspectionBatchCreate,
     ScenarioCreate,
 )
 from .units import to_mm
@@ -61,6 +65,29 @@ app = FastAPI(
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
     return RedirectResponse("/docs")
+
+
+@app.exception_handler(RequestValidationError)
+async def _sanitizing_validation_handler(request, exc: RequestValidationError):
+    """422 处理器：把错误详情里的 NaN/Infinity 回显替换为字符串。
+
+    Python json 无法编码非有限浮点（实测值非有限被拒收时 pydantic 会把
+    原始 input 原样放进错误），不清洗会退化为 500。
+    """
+
+    def clean(obj):
+        if isinstance(obj, float) and not math.isfinite(obj):
+            return repr(obj)
+        if isinstance(obj, Exception):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {k: clean(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [clean(v) for v in obj]
+        return obj
+
+    return JSONResponse(
+        status_code=422, content={"detail": clean(exc.errors())})
 
 
 @app.get("/health")
@@ -330,3 +357,79 @@ def cost_targets(chain_id: int, payload: CostTargetRequest) -> dict:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     answer["chain_id"] = chain_id
     return answer
+
+
+# -------------------------------------------------------- 来料检验批次
+
+def _serialized_rows(payload: InspectionBatchCreate) -> list[dict]:
+    """提交行的原样快照（单位与缺测标记保留），随批次冻结入库。"""
+    return [
+        {
+            "serial": row.serial,
+            "measurements": [
+                {"dimension_id": m.dimension_id, "value": m.value,
+                 "unit": m.unit.value}
+                for m in row.measurements
+            ],
+        }
+        for row in payload.rows
+    ]
+
+
+def _batch_response(row) -> dict:
+    return {
+        "batch_id": row.id,
+        "chain_id": row.chain_id,
+        "name": row.name,
+        "note": row.note,
+        "frozen": bool(row.frozen),
+        "bootstrap_samples": row.bootstrap_samples,
+        "random_seed": row.random_seed,
+        "created_at": row.created_at.isoformat(),
+        "rows": row.rows_json,
+        "report": row.report_json,
+        "baseline_comparison": row.comparison_json,
+    }
+
+
+@app.post("/chains/{chain_id}/inspection-batches", status_code=201,
+          tags=["inspection"])
+def create_inspection_batch(chain_id: int, payload: InspectionBatchCreate) -> dict:
+    """创建来料检验批次：复核链外尺寸/重复序号/非有限值/未知单位后冻结入库。
+
+    缺测可入库（响应 report.gaps 列出每个工件的缺口）；批次落库后不可修改，
+    后续测量应另建批次。
+    """
+    chain_row = _load_chain(chain_id)
+    nc = rebuild_normalized(chain_row.request_json)
+    try:
+        rows = validate_rows(nc, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    report = analyze_batch(
+        nc, rows, payload.bootstrap_samples, payload.random_seed)
+    comparison = baseline_comparison(nc, chain_row.result_json, report)
+    stored_rows = _serialized_rows(payload)
+    batch_id = db.save_inspection_batch(
+        chain_id, payload.name, payload.note, stored_rows, report,
+        comparison, payload.bootstrap_samples, payload.random_seed,
+    )
+    saved = db.get_inspection_batch(batch_id)
+    return _batch_response(saved)
+
+
+@app.get("/chains/{chain_id}/inspection-batches", tags=["inspection"])
+def list_inspection_batches(chain_id: int) -> dict:
+    _load_chain(chain_id)
+    return {"chain_id": chain_id,
+            "batches": db.list_inspection_batches(chain_id)}
+
+
+@app.get("/inspection-batches/{batch_id}", tags=["inspection"])
+def get_inspection_batch(batch_id: int) -> dict:
+    """读取冻结批次：报告在创建时已固化，多次读取内容不变。"""
+    row = db.get_inspection_batch(batch_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"检验批次 {batch_id} 不存在")
+    return _batch_response(row)

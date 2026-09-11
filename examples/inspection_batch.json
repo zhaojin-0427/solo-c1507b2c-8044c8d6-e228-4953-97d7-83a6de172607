@@ -1,0 +1,39 @@
+{
+  "name": "2026-W37-lot-A",
+  "note": "供应商批号 A 的 40 件来料；W007 漏测 L2，W010 的 L3 待复测（null）",
+  "bootstrap_samples": 10000,
+  "random_seed": 20260911,
+  "rows": [
+    {
+      "serial": "W001",
+      "measurements": [
+        {"dimension_id": "L1", "value": 50.046, "unit": "mm"},
+        {"dimension_id": "L2", "value": 30.302, "unit": "mm"},
+        {"dimension_id": "L3", "value": 79.981, "unit": "mm"}
+      ]
+    },
+    {
+      "serial": "W002",
+      "measurements": [
+        {"dimension_id": "L1", "value": 50.051, "unit": "mm"},
+        {"dimension_id": "L2", "value": 1.193, "unit": "in"},
+        {"dimension_id": "L3", "value": 80.012, "unit": "mm"}
+      ]
+    },
+    {
+      "serial": "W007",
+      "measurements": [
+        {"dimension_id": "L1", "value": 50.038, "unit": "mm"},
+        {"dimension_id": "L3", "value": 79.995, "unit": "mm"}
+      ]
+    },
+    {
+      "serial": "W010",
+      "measurements": [
+        {"dimension_id": "L1", "value": 50.044, "unit": "mm"},
+        {"dimension_id": "L2", "value": 30.295, "unit": "mm"},
+        {"dimension_id": "L3", "value": null, "unit": "mm"}
+      ]
+    }
+  ]
+}

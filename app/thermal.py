@@ -30,8 +30,9 @@
     σ²_C = σ²_mfg + σ²_α + σ²_T
 
 蒙特卡洛固定种子，四个独立子流（SeedSequence 派生）：组合样本按完整
-非线性 L0(1+αΔT) 生成；另给三个分量单独样本，用于经验超差率与
-分量方差贡献拆分。
+非线性 L0(1+αΔT) 生成（制造偏差只乘一次热态比例）；另给三个分量的
+零均值偏差样本。分量超差率在「该工况热态名义间隙 + 单项偏差」上对照
+规格计算，而非把零均值偏差直接当作绝对间隙。
 
 装配基准温度 T_a：把每个尺寸的参考温度重置为 T_a（重新基准化），
 ΔT 以 T_a 为公共零点重算；垫片厚度定义在 T_a、不建模热膨胀。
@@ -435,11 +436,12 @@ def _gaussian_samples(rng: np.random.Generator, n: int, k: int,
     return rng.standard_normal((n, k)) @ _cholesky_psd(corr).T
 
 
-def _manufacturing_samples(rng, nc: NormalizedChain, n: int,
-                           scale: np.ndarray) -> np.ndarray:
-    """制造偏差样本 δ_i（mm，基线口径），再按热态 scale 等比缩放。
+def _manufacturing_deviations(rng, nc: NormalizedChain, n: int) -> np.ndarray:
+    """基线公差带口径的制造偏差样本 δ_i（mm），未做热态缩放。
 
     分布/相关口径与基线链蒙特卡洛完全一致（Gaussian copula）。
+    热态制造分量为 δ_i·(1+αΔT)；缩放只允许发生一次——组合样本按
+    (L0+δ)·[1+(α+Δα)(ΔT+δT)] 生成，绝不能先把 δ 乘上 scale 再乘一次。
     """
     nd = nc.dimensions
     k = len(nd)
@@ -458,7 +460,7 @@ def _manufacturing_samples(rng, nc: NormalizedChain, n: int,
         z = rng.standard_normal((n, k))
         uniforms = rng.random((n, k))
 
-    delta = np.zeros((n, k))  # 相对带中心的制造偏差
+    delta = np.zeros((n, k))  # 相对带中心的基线制造偏差
     for j, d in enumerate(nd):
         a = sample_halfs[j]
         if d.distribution == DistributionType.NORMAL.value:
@@ -467,30 +469,39 @@ def _manufacturing_samples(rng, nc: NormalizedChain, n: int,
             delta[:, j] = -a + 2.0 * a * uniforms[:, j]
         else:  # triangular
             delta[:, j] = _triangular_inverse(uniforms[:, j], a)
-    return delta * scale[None, :]
+    return delta
 
 
-def _closure_stats_vec(closure: np.ndarray, lsl, usl) -> dict:
-    """封闭环样本向量的统计量与经验超差率。"""
+def _closure_stats_vec(closure: np.ndarray, lsl, usl,
+                       reject_reference: float = 0.0) -> dict:
+    """封闭环样本向量的统计量与经验超差率。
+
+    reject_reference 为超差率判定的叠加基准（热态名义间隙）：分量样本本身
+    是零均值偏差，必须叠加到对应热态名义间隙上再与规格比较，不能直接拿
+    零均值偏差对照绝对间隙规格。组合样本已是绝对间隙，传 0。
+    """
     n = len(closure)
     sigma = float(closure.std(ddof=1)) if n > 1 else 0.0
     q005, q995 = np.quantile(closure, [0.005, 0.995])
     reject = None
     if lsl is not None or usl is not None:
+        evaluated = closure + reject_reference
         mask = np.zeros(n, dtype=bool)
         if lsl is not None:
-            mask |= closure < lsl
+            mask |= evaluated < lsl
         if usl is not None:
-            mask |= closure > usl
+            mask |= evaluated > usl
         reject = float(mask.mean())
     return {
-        "mean_gap_mm": float(closure.mean()),
+        "mean_deviation_mm": float(closure.mean()),
         "sigma_mm": sigma,
         "lower_quantile_mm": float(q005),
         "upper_quantile_mm": float(q995),
         "min_sample_mm": float(closure.min()),
         "max_sample_mm": float(closure.max()),
         "reject_probability": reject,
+        "reject_reference_gap_mm": (
+            reject_reference if (lsl is not None or usl is not None) else None),
     }
 
 
@@ -517,13 +528,15 @@ def monte_carlo_condition(model: ThermalModel, ci: int, *,
     is_range = np.array([t.kind == "range" for t in temps])
     t_sigma = np.array([t.sigma for t in temps])
 
-    # --- 制造偏差（热态缩放后的 δ）---
-    delta_mfg = _manufacturing_samples(rng_mfg, nc, n, scale)
+    # --- 制造偏差（基线公差带口径，未做热态缩放）---
+    delta_mfg = _manufacturing_deviations(rng_mfg, nc, n)
+    # 单来源热态制造偏差（热态缩放只发生这一次）：δ_i·(1+αΔT)
+    mfg_component = (delta_mfg * scale[None, :]) @ signs
 
     # --- α 不确定度（多元正态，相关矩阵 r_alpha）---
     za = _gaussian_samples(rng_a, n, k, model.r_alpha, nd)
     da = u_alpha[None, :] * za                       # Δα_i
-    length_alpha = l0_mean[None, :] * d_t[None, :] * da
+    alpha_component = (l0_mean[None, :] * d_t[None, :] * da) @ signs
 
     # --- 温度：固定 u(T) 走相关正态；区间独立均匀 ---
     dt_fluc = np.zeros((n, k))
@@ -536,17 +549,18 @@ def monte_carlo_condition(model: ThermalModel, ci: int, *,
         u_range = rng_t.random((n, int(is_range.sum())))
         halves = np.array([t.half for t in temps])[is_range]
         dt_fluc[:, is_range] = -halves[None, :] + 2.0 * halves[None, :] * u_range
-    length_temp = l0_mean[None, :] * alpha[None, :] * dt_fluc
+    temp_component = (l0_mean[None, :] * alpha[None, :] * dt_fluc) @ signs
 
-    # --- 完整非线性组合：L = (L0 + δ_mfg)·[1 + (α+Δα)·(ΔT + δT)] ---
-    # 复用上面三组样本（共享同一组随机数 => 组合与分量严格同源）
+    # --- 完整非线性组合：L = (L0 + δ)·[1 + (α+Δα)·(ΔT + δT)] ---
+    # 关键：L0+δ 用的是**未热态缩放**的基线偏差，热态比例只由括号内
+    # [1+αΔT] 施加一次，避免制造波动被重复缩放（否则 scale=2 时组合 σ
+    # 会变成制造分量的两倍）。
     l0_sample = l0_mean[None, :] + delta_mfg
     alpha_sample = alpha[None, :] + da
     dt_sample = d_t[None, :] + dt_fluc
     hot_scale = 1.0 + alpha_sample * dt_sample
     # 极端 u(α) 抽样可能使个别样本 scale 越界，截断到正下限保护
     hot_scale = np.clip(hot_scale, MIN_SCALE, None)
-    length_all = l0_sample * hot_scale
 
     # 垫片（固定尺寸 + 正态厚度不确定度）；用组合子流的独立一列，
     # 叠加在封闭环上，所有工况相同。
@@ -556,23 +570,30 @@ def monte_carlo_condition(model: ThermalModel, ci: int, *,
             shim_nominal + shim_sigma * rng_all.standard_normal(n))
 
     lsl, usl = nc.closure_lsl_mm, nc.closure_usl_mm
-    closure_all = length_all @ signs + shim_effect
-    stats_all = _closure_stats_vec(closure_all, lsl, usl)
+    closure_all = (l0_sample * hot_scale) @ signs + shim_effect
+    # 组合样本本身就是绝对间隙（含热态名义），超差判定基准为 0
+    stats_all = _closure_stats_vec(closure_all, lsl, usl, reject_reference=0.0)
+    stats_all["mean_gap_mm"] = stats_all["mean_deviation_mm"]
 
-    def comp_stats(closure_component):
-        return _closure_stats_vec(closure_component, lsl, usl)
+    # 分量样本是**零均值单项偏差**，必须叠加到对应热态名义间隙上，
+    # 再与规格比较；不能直接拿零均值偏差对照绝对间隙规格（否则超差率≈1）。
+    ref_gap = float(signs @ (l0_mean * scale)) + shim_sign * shim_nominal
 
-    stats_mfg = comp_stats(delta_mfg @ signs)
-    stats_alpha = comp_stats(length_alpha @ signs)
-    stats_temp = comp_stats(length_temp @ signs)
+    def comp_stats(component_closure):
+        return _closure_stats_vec(component_closure, lsl, usl,
+                                  reject_reference=ref_gap)
 
-    # 分量方差贡献（封闭环口径），用于占比拆分
+    stats_mfg = comp_stats(mfg_component)
+    stats_alpha = comp_stats(alpha_component)
+    stats_temp = comp_stats(temp_component)
+
+    # 分量方差贡献（封闭环口径，热态），用于占比拆分
     def closure_var(closure):
         return float(closure.var(ddof=1)) if n > 1 else 0.0
 
-    v_mfg = closure_var(delta_mfg @ signs)
-    v_alpha = closure_var(length_alpha @ signs)
-    v_temp = closure_var(length_temp @ signs)
+    v_mfg = closure_var(mfg_component)
+    v_alpha = closure_var(alpha_component)
+    v_temp = closure_var(temp_component)
     v_all = v_mfg + v_alpha + v_temp
     v_shim = shim_sigma ** 2
 
@@ -585,6 +606,10 @@ def monte_carlo_condition(model: ThermalModel, ci: int, *,
             **stats_all,
             "nominal_model": "L=(L0+δ_mfg)[1+(α+Δα)(ΔT+δT)]，完整非线性",
         },
+        "component_reject_convention": (
+            "分量样本为零均值单项偏差，超差率在「热态名义间隙 "
+            f"{ref_gap:.9g} mm + 单项偏差」上对照规格计算；"
+            "sigma/分位/极值仍为偏差本身的统计量"),
         "components": {
             "manufacturing": stats_mfg,
             "expansion_coefficient": stats_alpha,
@@ -614,25 +639,24 @@ def analyze(model: ThermalModel, *, t0=None, alpha=None, u_alpha=None,
             shim_sign=shim_sign, mc_samples=mc_samples,
             mc_seed_base=mc_seed_base))
 
-    # 最先越过规格的工况：按提交顺序，WC 硬界越界优先；
-    # 均未越界时取 RSS ±3σ 界出现超差概率的首个工况；再否则取余量最小者。
+    # 最先越过规格的工况（按提交顺序）：
+    # 1) WC 硬界实际穿过 LSL/USL；2) 否则 RSS ±3σ 界实际穿过规格；
+    # 所有工况边界均在规格内（安全）时返回 None，不产生越界标记。
+    # 注意：RSS 尾部概率 >0 在有限 σ 下几乎恒成立，不能仅凭它判定“越界”。
     first_breach = None
     for ci, r in enumerate(results):
-        if r["analytic"]["worst_case"]["reject_probability"] == 1.0:
+        wc = r["analytic"]["worst_case"]
+        if (lsl is not None and wc["lower_bound_mm"] < lsl) or (
+                usl is not None and wc["upper_bound_mm"] > usl):
             first_breach = _breach_info(ci, r, "worst_case", lsl, usl)
             break
     if first_breach is None:
         for ci, r in enumerate(results):
-            if r["analytic"]["rss"]["reject_probability"] > 0:
+            rr = r["analytic"]["rss"]
+            if (lsl is not None and rr["lower_bound_mm"] < lsl) or (
+                    usl is not None and rr["upper_bound_mm"] > usl):
                 first_breach = _breach_info(ci, r, "rss", lsl, usl)
                 break
-    if first_breach is None:
-        margins = [(r["analytic"]["spec_margin_mm"], ci)
-                   for ci, r in enumerate(results)
-                   if r["analytic"]["spec_margin_mm"] is not None]
-        if margins:
-            _, ci = min(margins, key=lambda x: (x[0], x[1]))
-            first_breach = _breach_info(ci, results[ci], "margin", lsl, usl)
 
     worst_wc = max(
         (r["analytic"]["worst_case"]["reject_probability"] or 0.0)
@@ -660,21 +684,23 @@ def analyze(model: ThermalModel, *, t0=None, alpha=None, u_alpha=None,
 
 def _breach_info(ci: int, result: dict, criterion: str,
                  lsl, usl) -> dict:
-    """越界方向：WC/RSS 界穿过 LSL 记 lower，穿过 USL 记 upper（可同时）。"""
+    """越界方向：WC/RSS 界实际穿过 LSL 记 lower，穿过 USL 记 upper。
+
+    调用方只在边界确实越过规格时调用，因此 breach_side 至少有一个方向。
+    """
     a = result["analytic"]
     side = []
-    if criterion in ("worst_case", "rss"):
-        b = a[criterion]
-        lo, hi = b["lower_bound_mm"], b["upper_bound_mm"]
-        if lsl is not None and lo < lsl:
-            side.append("lower")
-        if usl is not None and hi > usl:
-            side.append("upper")
+    b = a[criterion]
+    lo, hi = b["lower_bound_mm"], b["upper_bound_mm"]
+    if lsl is not None and lo < lsl:
+        side.append("lower")
+    if usl is not None and hi > usl:
+        side.append("upper")
     return {
         "condition_index": ci,
         "condition_name": a["name"],
         "criterion": criterion,
-        "breach_side": side if side else None,
+        "breach_side": side,
         "worst_case_bounds_mm": [
             a["worst_case"]["lower_bound_mm"],
             a["worst_case"]["upper_bound_mm"]],

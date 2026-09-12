@@ -904,7 +904,11 @@ def create_thermal_analysis(chain_id: int,
                     "SeedSequence([seed, 0x74686572, condition]).spawn(4)："
                     "制造/膨胀系数/温度/完整非线性组合",
                 "combined_model":
-                    "L=(L0+δ_mfg)[1+(α+Δα)(ΔT+δT)]（完整非线性，同种子复现）",
+                    "L=(L0+δ_mfg)[1+(α+Δα)(ΔT+δT)]（完整非线性，同种子复现）；"
+                    "制造偏差 δ 仅由括号内 1+αΔT 缩放一次，不重复缩放",
+                "component_reject":
+                    "分量样本为零均值单项偏差，其超差率在「热态名义间隙 + "
+                    "单项偏差」上对照规格，而非用绝对间隙规格直接判定零均值偏差",
             },
             "frozen_baseline": "基线链输入、热参数候选与随机种子随版本冻结",
         },

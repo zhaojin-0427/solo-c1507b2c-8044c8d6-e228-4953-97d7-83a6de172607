@@ -569,3 +569,111 @@ def test_spec_margin_negative_when_band_crosses_limit():
     hot = res["conditions"][1]["analytic"]
     assert hot["worst_case"]["upper_bound_mm"] > 0.60
     assert hot["spec_margin_mm"] < 0
+
+
+# ------------------------------------------------- 统计逻辑回归（三项修正）
+
+def test_manufacturing_fluctuation_not_double_scaled():
+    """热伸缩比例 scale=2、仅有制造波动时：组合 σ 必须等于制造分量 σ。
+
+    旧实现先把制造偏差乘一次 scale 再乘 [1+αΔT]，组合 σ 变成制造分量的
+    两倍；修正后热态缩放只发生一次。
+    """
+    chain = {
+        "name": "scale2",
+        "closure_lower_limit": -1.0,
+        "closure_upper_limit": 1.0,
+        "dimensions": [
+            {"id": "L1", "start": "a", "end": "b", "nominal": 10,
+             "upper_deviation": 0.02, "lower_deviation": -0.02,
+             "std_dev": 0.01, "distribution": "normal"},
+            {"id": "L2", "start": "b", "end": "a", "nominal": 10,
+             "upper_deviation": 0.0, "lower_deviation": 0.0,
+             "std_dev": 0.0, "distribution": "normal"}],
+        "mc_samples": 100000, "random_seed": 1}
+    nc = rebuild_normalized(chain)
+    # α=1e-3, ΔT=1000°C => 1+αΔT=2；u(α)=0 且温度精确 => 仅制造波动
+    payload = ThermalAnalysisCreate.model_validate({
+        "name": "scale2-th",
+        "dimensions": [
+            {"dimension_id": "L1", "reference_temperature": 20,
+             "alpha": 1e-3, "alpha_std_uncertainty": 0.0},
+            {"dimension_id": "L2", "reference_temperature": 20,
+             "alpha": 1e-3, "alpha_std_uncertainty": 0.0}],
+        "conditions": [{"name": "double",
+                        "global_temperature": {
+                            "fixed": {"mean": 1020, "std_uncertainty": 0}}}],
+        "mc_samples": 100000, "random_seed": 1})
+    model = th.build_model(nc, payload)
+    r = th.evaluate_condition(model, 0)
+    mc = r["monte_carlo"]
+    a = r["analytic"]["per_dimension"][0]
+    assert a["scale_1_plus_alpha_dt"] == pytest.approx(2.0)
+    sig_comb = mc["combined"]["sigma_mm"]
+    sig_mfg = mc["components"]["manufacturing"]["sigma_mm"]
+    # 制造分量理论 σ = 0.01 × 2 = 0.02
+    assert sig_mfg == pytest.approx(0.02, rel=2e-2)
+    # 组合 σ 不得变成制造分量的两倍（旧 bug），二者应一致
+    assert sig_comb == pytest.approx(sig_mfg, rel=2e-2)
+    assert r["analytic"]["rss"]["variance_components_mm2"][
+        "expansion_coefficient"] == 0.0
+    assert r["analytic"]["rss"]["variance_components_mm2"][
+        "temperature"] == 0.0
+
+
+def test_safe_condition_has_no_breach_marker():
+    """所有 WC/RSS 边界均在规格内时，first_spec_breach 必须为 None。"""
+    chain = dict(CHAIN, name="safe-chain",
+                 closure_lower_limit=-2.0, closure_upper_limit=2.0)
+    nc = rebuild_normalized(chain)
+    payload = ThermalAnalysisCreate.model_validate({
+        "name": "safe-th",
+        "dimensions": DIMS,
+        "conditions": [{"name": "mild",
+                        "global_temperature": {
+                            "fixed": {"mean": 40, "std_uncertainty": 1}}}],
+        "mc_samples": 40000, "random_seed": 2})
+    model = th.build_model(nc, payload)
+    out = th.analyze(model, mc_samples=40000)
+    a = out["conditions"][0]["analytic"]
+    assert a["worst_case"]["lower_bound_mm"] >= -2.0
+    assert a["worst_case"]["upper_bound_mm"] <= 2.0
+    assert a["spec_margin_mm"] > 0
+    assert out["summary"]["first_spec_breach"] is None
+
+
+def test_component_reject_uses_hot_nominal_reference():
+    """分量超差率须在「热态名义间隙 + 单项偏差」上对照规格，而非零均值偏差。"""
+    chain = dict(CHAIN, name="ref-chain",
+                 closure_lower_limit=-2.0, closure_upper_limit=2.0)
+    nc = rebuild_normalized(chain)
+    payload = ThermalAnalysisCreate.model_validate({
+        "name": "ref-th",
+        "dimensions": DIMS,
+        "conditions": [{"name": "mild",
+                        "global_temperature": {
+                            "fixed": {"mean": 40, "std_uncertainty": 1}}}],
+        "mc_samples": 40000, "random_seed": 3})
+    model = th.build_model(nc, payload)
+    r = th.evaluate_condition(model, 0, mc_samples=40000)
+    hot_mean = r["analytic"]["mean_gap_mm"]
+    mc = r["monte_carlo"]
+    for name in ("manufacturing", "expansion_coefficient", "temperature"):
+        comp = mc["components"][name]
+        # 超差判定基准 = 热态名义间隙（而非 0）
+        assert comp["reject_reference_gap_mm"] == pytest.approx(
+            hot_mean, abs=1e-9)
+        # 名义远在规格中部（±2），单项偏差很小 => 分量超差率应为 0，
+        # 旧实现拿零均值偏差对照 ±2 时不会误判，但对照 0.05/0.60 规格会
+        # ≈1.0；这里用真实规格再次核对
+    chain2 = dict(CHAIN, name="ref-chain2")
+    nc2 = rebuild_normalized(chain2)
+    model2 = th.build_model(nc2, payload)
+    r2 = th.evaluate_condition(model2, 0, mc_samples=40000)
+    mc2 = r2["monte_carlo"]
+    hot2 = r2["analytic"]["mean_gap_mm"]
+    assert 0.05 < hot2 < 0.60  # 热态名义在规格内
+    mfg = mc2["components"]["manufacturing"]
+    assert mfg["reject_reference_gap_mm"] == pytest.approx(hot2, abs=1e-9)
+    # 旧实现（基准 0）下该值 ≈1.0；修正后是真实的小概率尾部
+    assert mfg["reject_probability"] < 0.5

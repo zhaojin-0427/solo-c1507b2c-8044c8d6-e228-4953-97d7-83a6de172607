@@ -46,7 +46,10 @@ from .schemas import (
     InspectionBatchCreate,
     MeasurementPlanCreate,
     ScenarioCreate,
+    ThermalAnalysisCreate,
+    ThermalProposalRequest,
 )
+from .thermal import ThermalError, analyze as thermal_analyze, build_model, search_proposals
 from .units import to_mm
 
 
@@ -796,3 +799,218 @@ class _ReplayedTask:
             output_coverage_factor=snap["output_coverage_factor"],
             guard_band=GuardBandSpec(**snap["guard_band"]["submitted"]),
         )
+
+
+# -------------------------------------------------------- 热分析（温度工况）
+
+def _thermal_model_snapshot(model) -> dict:
+    """归一化热模型快照（随版本冻结；重复计算据此可精确复现）。"""
+    return {
+        "dimension_order": model.ids,
+        "reference_temperature_c": [float(x) for x in model.t0_c],
+        "reference_temperature_unit_submitted": model.t0_unit,
+        "alpha_per_K": [float(x) for x in model.alpha],
+        "alpha_std_uncertainty_per_K": [float(x) for x in model.u_alpha],
+        "alpha_unit_submitted": model.alpha_unit,
+        "alpha_correlation_matrix": model.r_alpha.tolist(),
+        "temperature_correlation_matrix": model.r_temp.tolist(),
+        "conditions": [
+            {
+                "name": model.condition_names[ci],
+                "note": model.condition_notes[ci],
+                "temperature_unit_submitted": model.condition_temp_units[ci],
+                "dimensions": [
+                    {"dimension_id": model.ids[i], **model.conditions[ci][i].raw,
+                     "normalized_c": {
+                         "mean": model.conditions[ci][i].mean,
+                         "half_width": model.conditions[ci][i].half,
+                         "std_uncertainty": model.conditions[ci][i].sigma}}
+                    for i in range(len(model.ids))],
+            }
+            for ci in range(len(model.conditions))
+        ],
+        "monte_carlo": {"samples": model.mc_samples, "seed": model.seed},
+        "formula": "L(T) = L0 [1 + alpha (T - T0)]",
+    }
+
+
+def _thermal_response(row) -> dict:
+    return {
+        "thermal_analysis_id": row.id,
+        "chain_id": row.chain_id,
+        "name": row.name,
+        "note": row.note,
+        "frozen": bool(row.frozen),
+        "mc_samples": row.mc_samples,
+        "random_seed": row.random_seed,
+        "created_at": row.created_at.isoformat(),
+        "baseline_preserved": True,
+        "submitted_input": row.request_json,
+        "model": row.model_json,
+        "result": row.result_json,
+    }
+
+
+@app.post("/chains/{chain_id}/thermal-analyses", status_code=201,
+          tags=["thermal"])
+def create_thermal_analysis(chain_id: int,
+                            payload: ThermalAnalysisCreate) -> dict:
+    """从冻结基线链建立热分析版本：逐尺寸 T0/α/u(α) + 工况温度。
+
+    按 L(T)=L0[1+α(T−T0)] 换算名义值与公差带，逐工况给出热态封闭环
+    均值、极值边界、RSS 与固定种子蒙特卡洛超差率，拆分制造偏差 /
+    膨胀系数 / 温度不确定度三类贡献，并指出最先越过规格的工况。
+    漏填尺寸、温度上下界倒置、α 或温度相关矩阵非半正定时拒绝（422）。
+    基线链不变，结果与种子随版本冻结（同一版本重复计算不变）。
+    """
+    chain_row = _load_chain(chain_id)
+    nc = rebuild_normalized(chain_row.request_json)
+    if nc.closure_lsl_mm is None or nc.closure_usl_mm is None:
+        raise HTTPException(
+            status_code=422,
+            detail="热分析要求基线链同时声明封闭环下限与上限"
+                   "（closure_lower_limit / closure_upper_limit），否则无法"
+                   "定义热态超差率与最先越界工况",
+        )
+    try:
+        model = build_model(nc, payload)
+        result = thermal_analyze(model)
+    except ThermalError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    snapshot = _thermal_model_snapshot(model)
+    result = {
+        **result,
+        "closure_spec_mm": {
+            "lower_limit": nc.closure_lsl_mm,
+            "upper_limit": nc.closure_usl_mm,
+        },
+        "traceability": {
+            "baseline_chain_id": chain_id,
+            "formula": "L(T) = L0 [1 + alpha (T - T0)]",
+            "uncertainty_sources": [
+                "制造偏差：基线分布/相关，热态按 1+αΔT 等比缩放",
+                "膨胀系数：GUM 一阶 (L0ΔT)·u(α)，相关矩阵传播",
+                "温度：固定温度 (L0α)·u(T) 相关传播；"
+                "温度区间为硬边界（独立均匀，WC 取半宽，σ=h/√3）",
+            ],
+            "worst_case_convention":
+                "制造半宽热态缩放；u(α)/固定 u(T) 按 ±3σ 扩展；"
+                "温度区间取硬半宽",
+            "monte_carlo": {
+                "samples": model.mc_samples,
+                "seed": model.seed,
+                "substreams":
+                    "SeedSequence([seed, 0x74686572, condition]).spawn(4)："
+                    "制造/膨胀系数/温度/完整非线性组合",
+                "combined_model":
+                    "L=(L0+δ_mfg)[1+(α+Δα)(ΔT+δT)]（完整非线性，同种子复现）",
+            },
+            "frozen_baseline": "基线链输入、热参数候选与随机种子随版本冻结",
+        },
+    }
+    analysis_id = db.save_thermal_analysis(
+        chain_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), snapshot, result,
+        payload.mc_samples, payload.random_seed)
+    saved = db.get_thermal_analysis(analysis_id)
+    return _thermal_response(saved)
+
+
+@app.get("/chains/{chain_id}/thermal-analyses", tags=["thermal"])
+def list_thermal_analyses(chain_id: int) -> dict:
+    _load_chain(chain_id)
+    return {"chain_id": chain_id,
+            "thermal_analyses": db.list_thermal_analyses(chain_id)}
+
+
+@app.get("/thermal-analyses/{analysis_id}", tags=["thermal"])
+def get_thermal_analysis(analysis_id: int) -> dict:
+    """读取冻结热分析版本：结果创建时固化，重复读取/计算内容不变。"""
+    row = db.get_thermal_analysis(analysis_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"热分析版本 {analysis_id} 不存在")
+    return _thermal_response(row)
+
+
+@app.post("/thermal-analyses/{analysis_id}/proposals", status_code=201,
+          tags=["thermal"])
+def create_thermal_proposal(analysis_id: int,
+                            payload: ThermalProposalRequest) -> dict:
+    """按候选材料 / 垫片 / 装配基准温度搜索热整改方案并排列。
+
+    可锁定材料（locked_materials 限定尺寸只能用指定材料）；每个方案给
+    候选材料系数、垫片厚度、装配基准温度与改动成本。解析粗筛后用与版本
+    同源的固定种子蒙特卡洛复核，按「全工况最差超差率 → 最小规格余量 →
+    成本」升序排列。候选表与种子随结果冻结。
+    """
+    row = db.get_thermal_analysis(analysis_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"热分析版本 {analysis_id} 不存在")
+    chain_row = _load_chain(row.chain_id)
+    nc = rebuild_normalized(chain_row.request_json)
+    model = build_model(
+        nc, ThermalAnalysisCreate.model_validate(row.request_json))
+    try:
+        result = search_proposals(model, payload)
+    except ThermalError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    result = {
+        **result,
+        "thermal_analysis_id": analysis_id,
+        "chain_id": row.chain_id,
+        "ranking_note":
+            "排序键（越小越优）：全工况最差固定种子 MC 超差率 → "
+            "全工况最小极值法规格余量（大者优先）→ 改动总成本；"
+            "零成本现状方案始终参与复核并列在其中",
+        "frozen_inputs": {
+            "baseline_chain_id": row.chain_id,
+            "thermal_analysis_seed": row.random_seed,
+            "candidate_table": payload.model_dump(mode="json"),
+        },
+    }
+    proposal_id = db.save_thermal_proposal(
+        analysis_id, row.chain_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), result)
+    saved = db.get_thermal_proposal(proposal_id)
+    return {
+        "proposal_id": saved.id,
+        "thermal_analysis_id": analysis_id,
+        "chain_id": row.chain_id,
+        "name": saved.name,
+        "note": saved.note,
+        "created_at": saved.created_at.isoformat(),
+        "submitted_input": saved.request_json,
+        "result": saved.result_json,
+    }
+
+
+@app.get("/thermal-analyses/{analysis_id}/proposals", tags=["thermal"])
+def list_thermal_proposals(analysis_id: int) -> dict:
+    row = db.get_thermal_analysis(analysis_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"热分析版本 {analysis_id} 不存在")
+    return {"thermal_analysis_id": analysis_id,
+            "proposals": db.list_thermal_proposals(analysis_id)}
+
+
+@app.get("/thermal-proposals/{proposal_id}", tags=["thermal"])
+def get_thermal_proposal(proposal_id: int) -> dict:
+    """读取冻结的热整改方案搜索结果。"""
+    row = db.get_thermal_proposal(proposal_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"热整改方案 {proposal_id} 不存在")
+    return {
+        "proposal_id": row.id,
+        "thermal_analysis_id": row.thermal_analysis_id,
+        "chain_id": row.chain_id,
+        "name": row.name,
+        "note": row.note,
+        "created_at": row.created_at.isoformat(),
+        "submitted_input": row.request_json,
+        "result": row.result_json,
+    }

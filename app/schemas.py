@@ -653,3 +653,308 @@ class AssemblyVersionCreate(BaseModel):
 
 
 LockedAssemblySpec.model_rebuild()
+
+
+# -------------------------------------------------------- 热分析（温度工况）
+
+class TemperatureUnit(str, Enum):
+    """温度单位（温差在摄氏与开尔文下数值相同）。"""
+
+    CELSIUS = "C"
+    KELVIN = "K"
+
+
+class ExpansionUnit(str, Enum):
+    """线膨胀系数单位。"""
+
+    PER_K = "/K"              # K^-1，如 2.3e-5
+    PPM_K = "ppm/K"           # 10^-6 K^-1，如 23
+    UM_PER_M_K = "um/m/K"     # 微米/米/K，数值与 ppm/K 相同
+
+
+# 线膨胀系数单位换算为 K^-1
+TO_PER_K: dict[str, float] = {
+    ExpansionUnit.PER_K.value: 1.0,
+    ExpansionUnit.PPM_K.value: 1e-6,
+    ExpansionUnit.UM_PER_M_K.value: 1e-6,
+}
+
+
+class ThermalDimensionSpec(BaseModel):
+    """逐尺寸热参数：参考温度 T0、线膨胀系数 α 及其标准不确定度 u(α)。
+
+    α 与 u_alpha 同单位（/K、ppm/K、um/m/K 三选一）；u_alpha 为标准
+    不确定度（非上下偏差），必须非负，0 表示材料系数精确已知。
+    """
+
+    dimension_id: str = Field(..., min_length=1)
+    reference_temperature: float = Field(..., description="尺寸参考温度 T0")
+    reference_temperature_unit: TemperatureUnit = TemperatureUnit.CELSIUS
+    alpha: float = Field(..., description="线膨胀系数（按 alpha_unit 计）")
+    alpha_std_uncertainty: float = Field(
+        ..., ge=0, description="线膨胀系数标准不确定度 u(α)，与 alpha 同单位"
+    )
+    alpha_unit: ExpansionUnit = ExpansionUnit.PER_K
+
+    @model_validator(mode="after")
+    def _check(self) -> "ThermalDimensionSpec":
+        for f in ("reference_temperature", "alpha", "alpha_std_uncertainty"):
+            if not math.isfinite(getattr(self, f)):
+                raise ValueError(
+                    f"尺寸 {self.dimension_id}: {f} 必须为有限数，"
+                    f"收到 {getattr(self, f)!r}"
+                )
+        if self.alpha < 0:
+            raise ValueError(
+                f"尺寸 {self.dimension_id}: 线膨胀系数不能为负，收到 {self.alpha}"
+            )
+        return self
+
+
+class FixedTemperatureSpec(BaseModel):
+    """固定温度工况：均值温度 + 可选温度标准不确定度 u(T)（独立/相关见矩阵）。"""
+
+    mean: float = Field(..., description="零件温度均值")
+    std_uncertainty: float = Field(
+        0.0, ge=0, description="温度标准不确定度 u(T)，0 表示温度精确控制"
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "FixedTemperatureSpec":
+        if not math.isfinite(self.mean):
+            raise ValueError(f"固定温度均值必须为有限数，收到 {self.mean!r}")
+        if not math.isfinite(self.std_uncertainty):
+            raise ValueError("温度标准不确定度必须为有限数")
+        return self
+
+
+class TemperatureRangeSpec(BaseModel):
+    """温度区间工况：[lower, upper] 均匀覆盖（端点合法，lower==upper 视为固定）。"""
+
+    lower: float = Field(..., description="温度区间下界")
+    upper: float = Field(..., description="温度区间上界")
+
+    @model_validator(mode="after")
+    def _check(self) -> "TemperatureRangeSpec":
+        if not math.isfinite(self.lower) or not math.isfinite(self.upper):
+            raise ValueError("温度区间上下界必须为有限数")
+        if self.lower > self.upper:
+            raise ValueError(
+                f"温度区间下界 {self.lower} 大于上界 {self.upper}（上下界倒置）"
+            )
+        return self
+
+
+class ConditionTemperatureSpec(BaseModel):
+    """工况内单尺寸温度：二选一——固定温度（含 u(T)）或均匀温度区间。"""
+
+    fixed: FixedTemperatureSpec | None = None
+    range: TemperatureRangeSpec | None = None
+
+    @model_validator(mode="after")
+    def _check(self) -> "ConditionTemperatureSpec":
+        if self.fixed is None and self.range is None:
+            raise ValueError("每个尺寸温度必须提供 fixed 或 range 之一")
+        if self.fixed is not None and self.range is not None:
+            raise ValueError("fixed 与 range 只能提供一个")
+        return self
+
+
+class ThermalConditionCreate(BaseModel):
+    """单个热工况：全局温度或逐尺寸温度（覆盖全局），两者合并须覆盖全部尺寸。"""
+
+    name: str = Field(..., min_length=1)
+    note: str = ""
+    temperature_unit: TemperatureUnit = TemperatureUnit.CELSIUS
+    # 全局温度（对工况内未在 dimension_temperatures 中显式覆盖的尺寸生效）
+    global_temperature: ConditionTemperatureSpec | None = None
+    # 尺寸 id -> 该尺寸温度；引用链外尺寸 / 与全局重复声明均拒绝
+    dimension_temperatures: dict[str, ConditionTemperatureSpec] = Field(
+        default_factory=dict
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "ThermalConditionCreate":
+        if self.global_temperature is None and not self.dimension_temperatures:
+            raise ValueError(
+                f"工况 {self.name}: 必须提供全局温度或至少一个逐尺寸温度"
+            )
+        return self
+
+
+class ThermalAnalysisCreate(BaseModel):
+    """从冻结基线链建立热分析版本：逐尺寸热参数 + 工况列表 + 不确定度相关。"""
+
+    name: str = Field(..., min_length=1)
+    note: str = ""
+    dimensions: list[ThermalDimensionSpec] = Field(
+        ..., min_length=1,
+        description="逐尺寸热参数，必须恰好覆盖基线链全部尺寸（不多不少）",
+    )
+    conditions: list[ThermalConditionCreate] = Field(
+        ..., min_length=1, description="热工况（零件温度或温度区间），按提交顺序编号"
+    )
+    # 膨胀系数不确定度 u(α) 之间的 Pearson 相关（默认全独立）
+    alpha_correlations: list[CorrelationSpec] = Field(default_factory=list)
+    # 温度标准不确定度 u(T) 之间的 Pearson 相关（默认全独立）；
+    # 温度区间为硬边界（均匀抽样），不参与相关传播。
+    temperature_correlations: list[CorrelationSpec] = Field(default_factory=list)
+    mc_samples: int = Field(
+        200_000, ge=1_000, le=5_000_000,
+        description="每工况固定种子蒙特卡洛样本数（含分量拆分 4 个子流）",
+    )
+    random_seed: int = Field(
+        20260914, ge=0, description="热分析固定随机种子；同一版本重复计算不变"
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "ThermalAnalysisCreate":
+        ids = [d.dimension_id for d in self.dimensions]
+        dup = sorted({i for i in ids if ids.count(i) > 1})
+        if dup:
+            raise ValueError(f"热参数中尺寸重复填写: {dup}")
+        id_set = set(ids)
+
+        names = [c.name for c in self.conditions]
+        dup_names = sorted({n for n in names if names.count(n) > 1})
+        if dup_names:
+            raise ValueError(f"工况名称重复: {dup_names}")
+
+        def _check_corr(corrs, label):
+            seen: set[frozenset[str]] = set()
+            for c in corrs:
+                if c.dim_a not in id_set or c.dim_b not in id_set:
+                    raise ValueError(
+                        f"{label}相关项引用了未填写热参数的尺寸: "
+                        f"{c.dim_a!r}, {c.dim_b!r}"
+                    )
+                key = frozenset((c.dim_a, c.dim_b))
+                if key in seen:
+                    raise ValueError(
+                        f"尺寸 {c.dim_a} 与 {c.dim_b} 的{label}相关重复声明"
+                    )
+                seen.add(key)
+            ChainCreate._check_psd(ids, corrs)
+
+        _check_corr(self.alpha_correlations, "膨胀系数")
+        _check_corr(self.temperature_correlations, "温度")
+        return self
+
+
+# ------------------------------------------------- 热分析方案搜索（材料/垫片）
+
+class CandidateMaterialSpec(BaseModel):
+    """候选材料：可对一个或多个尺寸替换 α 与 u(α)（同单位），带改动成本。"""
+
+    material_id: str = Field(..., min_length=1)
+    name: str = Field("", description="材料名称（如 6061-T6 铝合金）")
+    applies_to: list[str] = Field(
+        ..., min_length=1, description="替换生效的尺寸 id（属于该热版本）"
+    )
+    alpha: float = Field(..., ge=0)
+    alpha_std_uncertainty: float = Field(..., ge=0)
+    alpha_unit: ExpansionUnit = ExpansionUnit.PER_K
+    cost: float = Field(..., ge=0, description="采用该材料的改动成本")
+
+    @model_validator(mode="after")
+    def _check(self) -> "CandidateMaterialSpec":
+        if not math.isfinite(self.alpha) or not math.isfinite(
+                self.alpha_std_uncertainty) or not math.isfinite(self.cost):
+            raise ValueError(
+                f"候选材料 {self.material_id}: α / u(α) / 成本必须为有限数"
+            )
+        if len(set(self.applies_to)) != len(self.applies_to):
+            raise ValueError(
+                f"候选材料 {self.material_id}: applies_to 中尺寸重复"
+            )
+        return self
+
+
+class ShimCandidateSpec(BaseModel):
+    """候选垫片：在封闭环上增加 sign × 名义厚度的固定尺寸（在装配基准温度下）。
+
+    垫片在所有工况下厚度相同（不建模其热膨胀——在装配基准温度下定义），
+    厚度公差/不确定度由 std_dev（正态标准不确定度）给出。
+    """
+
+    shim_id: str = Field(..., min_length=1)
+    name: str = ""
+    thickness: float = Field(..., gt=0, description="垫片名义厚度（按 unit 计）")
+    std_dev: float = Field(
+        0.0, ge=0, description="垫片厚度标准不确定度（正态，与 thickness 同单位）"
+    )
+    unit: LengthUnit = LengthUnit.MM
+    closure_sign: Literal[1, -1] = Field(
+        1, description="垫片在封闭环中的方向系数（+1 增隙 / -1 减隙）"
+    )
+    cost: float = Field(..., ge=0)
+
+    @model_validator(mode="after")
+    def _check(self) -> "ShimCandidateSpec":
+        for f in ("thickness", "std_dev", "cost"):
+            if not math.isfinite(getattr(self, f)):
+                raise ValueError(
+                    f"垫片 {self.shim_id}: {f} 必须为有限数，"
+                    f"收到 {getattr(self, f)!r}"
+                )
+        return self
+
+
+class AssemblyReferenceTemperatureSpec(BaseModel):
+    """候选装配基准温度：以 T_a 为公共基准重算各工况温差（可选成本）。"""
+
+    temperature: float = Field(..., description="装配基准温度 T_a")
+    unit: TemperatureUnit = TemperatureUnit.CELSIUS
+    cost: float = Field(0.0, ge=0)
+
+    @model_validator(mode="after")
+    def _check(self) -> "AssemblyReferenceTemperatureSpec":
+        if not math.isfinite(self.temperature):
+            raise ValueError(
+                f"装配基准温度必须为有限数，收到 {self.temperature!r}"
+            )
+        if not math.isfinite(self.cost):
+            raise ValueError("装配基准温度改动成本必须为有限数")
+        return self
+
+
+class ThermalProposalRequest(BaseModel):
+    """热分析方案搜索：锁定材料 + 候选材料/垫片/装配基准温度，按全工况排列。"""
+
+    name: str = Field(..., min_length=1)
+    note: str = ""
+    # 锁定材料：尺寸 id -> material_id（该尺寸只允许用锁定材料或保持现状）
+    locked_materials: dict[str, str] = Field(default_factory=dict)
+    candidates: list[CandidateMaterialSpec] = Field(
+        ..., min_length=1, description="候选材料（保持现状的零成本方案始终隐式包含）"
+    )
+    shim_candidates: list[ShimCandidateSpec] = Field(default_factory=list)
+    assembly_reference_temperatures: list[AssemblyReferenceTemperatureSpec] = Field(
+        default_factory=list
+    )
+    mc_samples: int = Field(
+        50_000, ge=1_000, le=1_000_000,
+        description="方案复核固定种子蒙特卡洛样本数（版本种子派生）",
+    )
+    max_candidates_returned: int = Field(50, ge=1, le=200)
+
+    @model_validator(mode="after")
+    def _check(self) -> "ThermalProposalRequest":
+        mat_ids = [c.material_id for c in self.candidates]
+        dup = sorted({m for m in mat_ids if mat_ids.count(m) > 1})
+        if dup:
+            raise ValueError(f"候选材料 id 重复: {dup}")
+        shim_ids = [s.shim_id for s in self.shim_candidates]
+        dup_s = sorted({m for m in shim_ids if shim_ids.count(m) > 1})
+        if dup_s:
+            raise ValueError(f"垫片 id 重复: {dup_s}")
+        known = set(mat_ids)
+        for dim_id, mat_id in self.locked_materials.items():
+            if mat_id not in known:
+                raise ValueError(
+                    f"尺寸 {dim_id} 锁定的材料 {mat_id!r} 不在候选表中"
+                )
+        return self
+
+
+LockedAssemblySpec.model_rebuild()

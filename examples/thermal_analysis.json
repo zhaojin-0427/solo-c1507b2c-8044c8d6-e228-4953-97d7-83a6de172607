@@ -1,0 +1,65 @@
+{
+  "name": "gearbox-thermal-v1",
+  "note": "减速箱轴向端隙：L1 铝合金壳体 / L2 铜隔套 / L3 钢轴；参考温度 20°C，冷/装配/热三工况",
+  "dimensions": [
+    {
+      "dimension_id": "L1",
+      "reference_temperature": 20,
+      "reference_temperature_unit": "C",
+      "alpha": 23,
+      "alpha_unit": "ppm/K",
+      "alpha_std_uncertainty": 1
+    },
+    {
+      "dimension_id": "L2",
+      "reference_temperature": 20,
+      "reference_temperature_unit": "C",
+      "alpha": 17,
+      "alpha_unit": "ppm/K",
+      "alpha_std_uncertainty": 1
+    },
+    {
+      "dimension_id": "L3",
+      "reference_temperature": 20,
+      "reference_temperature_unit": "C",
+      "alpha": 11,
+      "alpha_unit": "ppm/K",
+      "alpha_std_uncertainty": 0.5
+    }
+  ],
+  "alpha_correlations": [
+    {"dim_a": "L2", "dim_b": "L3", "rho": 0.3}
+  ],
+  "temperature_correlations": [],
+  "conditions": [
+    {
+      "name": "cold-start",
+      "note": "冷启动，零件温度 -20°C±扩展（标准不确定度 2°C）",
+      "temperature_unit": "C",
+      "global_temperature": {"fixed": {"mean": -20, "std_uncertainty": 2}}
+    },
+    {
+      "name": "assembly",
+      "note": "装配车间恒温",
+      "temperature_unit": "C",
+      "global_temperature": {"fixed": {"mean": 20, "std_uncertainty": 0.5}}
+    },
+    {
+      "name": "hot-operating",
+      "note": "热态运行：温度在 60~80°C 区间（硬边界，均匀覆盖）",
+      "temperature_unit": "C",
+      "global_temperature": {"range": {"lower": 60, "upper": 80}}
+    },
+    {
+      "name": "mixed-hot",
+      "note": "壳体单独更热（逐尺寸覆盖全局温度）",
+      "temperature_unit": "C",
+      "global_temperature": {"fixed": {"mean": 60, "std_uncertainty": 1.5}},
+      "dimension_temperatures": {
+        "L1": {"range": {"lower": 70, "upper": 90}}
+      }
+    }
+  ],
+  "mc_samples": 200000,
+  "random_seed": 20260914
+}

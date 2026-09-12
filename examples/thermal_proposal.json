@@ -1,0 +1,50 @@
+{
+  "name": "gearbox-thermal-remedy-v1",
+  "note": "热整改候选：L1 换殷钢降膨胀、L3 用认证钢材收紧 u(α)，配合垫片与提高装配基准温度",
+  "locked_materials": {},
+  "candidates": [
+    {
+      "material_id": "invar36",
+      "name": "殷钢 Invar 36",
+      "applies_to": ["L1"],
+      "alpha": 1.2e-6,
+      "alpha_unit": "/K",
+      "alpha_std_uncertainty": 0.3e-6,
+      "cost": 50
+    },
+    {
+      "material_id": "aluminum-cert",
+      "name": "认证铝合金（系数证书收紧）",
+      "applies_to": ["L1"],
+      "alpha": 23e-6,
+      "alpha_unit": "/K",
+      "alpha_std_uncertainty": 0.2e-6,
+      "cost": 5
+    },
+    {
+      "material_id": "steel-cert",
+      "name": "认证调质钢",
+      "applies_to": ["L3"],
+      "alpha": 11e-6,
+      "alpha_unit": "/K",
+      "alpha_std_uncertainty": 0.1e-6,
+      "cost": 8
+    }
+  ],
+  "shim_candidates": [
+    {
+      "shim_id": "shim-0.05",
+      "name": "0.05 mm 调整垫片",
+      "thickness": 0.05,
+      "unit": "mm",
+      "std_dev": 0.005,
+      "closure_sign": 1,
+      "cost": 2
+    }
+  ],
+  "assembly_reference_temperatures": [
+    {"temperature": 25, "unit": "C", "cost": 1}
+  ],
+  "mc_samples": 50000,
+  "max_candidates_returned": 30
+}

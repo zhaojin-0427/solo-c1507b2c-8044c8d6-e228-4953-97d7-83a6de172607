@@ -94,6 +94,12 @@ python3 -m venv --without-pip .venv        # 若 venv 自带 pip 可省略 get-p
 | GET | `/assembly-tasks/{tid}/versions` | 任务的版本线 |
 | GET | `/assembly-versions/{vid}` | 读取冻结装配版本 |
 | POST | `/assembly-versions/{vid}/rearrange` | 锁定已确认组合，另建版本重排其余实例 |
+| POST | `/chains/{id}/thermal-analyses` | 从冻结基线建立**热分析版本**（逐尺寸 T0/α/u(α)+工况） |
+| GET | `/chains/{id}/thermal-analyses` | 该链下的热分析版本列表 |
+| GET | `/thermal-analyses/{tid}` | 读取冻结热分析版本（重复读取结果不变） |
+| POST | `/thermal-analyses/{tid}/proposals` | 热整改方案搜索（候选材料/垫片/装配基准温度，按全工况排列） |
+| GET | `/thermal-analyses/{tid}/proposals` | 该热版本下的方案搜索结果列表 |
+| GET | `/thermal-proposals/{pid}` | 读取冻结的热整改方案结果 |
 
 ## 典型流程
 
@@ -125,6 +131,12 @@ curl -s -X POST localhost:8000/chains/1/measurement-plans \
   -H 'Content-Type: application/json' -d @examples/measurement_plan.json
 curl -s -X POST localhost:8000/chains/1/inspection-batches \
   -H 'Content-Type: application/json' -d @examples/inspection_batch_with_plan.json
+
+# 7) 从冻结基线建立热分析版本（温度工况），再搜索热整改方案
+curl -s -X POST localhost:8000/chains/1/thermal-analyses \
+  -H 'Content-Type: application/json' -d @examples/thermal_analysis.json
+curl -s -X POST localhost:8000/thermal-analyses/1/proposals \
+  -H 'Content-Type: application/json' -d @examples/thermal_proposal.json
 ```
 
 ### 成本模型
@@ -354,6 +366,81 @@ curl -s -X POST localhost:8000/chains/1/assembly-tasks \
   后续批次追加数据或新建测量方案均不改写历史版本（同种子下 MC 复核
   可精确复现）。
 
+## 温度工况热分析（热态装配间隙）
+
+在**冻结基线链**之上建立不可变热分析版本（示例
+`examples/thermal_analysis.json`），评估温度变化下的装配间隙：
+
+```bash
+.venv/bin/python run.py &
+curl -s -X POST localhost:8000/chains -H 'Content-Type: application/json' \
+  -d @examples/chain.json                 # 基线必须先创建且声明封闭环上下限
+curl -s -X POST localhost:8000/chains/1/thermal-analyses \
+  -H 'Content-Type: application/json' -d @examples/thermal_analysis.json
+```
+
+基线链**不被覆盖**，热参数与工况随版本冻结；同一版本重复计算结果不变。
+
+### 逐尺寸热参数与工况温度
+
+* `dimensions[]` 必须**恰好覆盖**基线链全部尺寸（漏填 / 链外 / 重复均 422），
+  每项给参考温度 `reference_temperature`（°C 或 K）、线膨胀系数 `alpha`
+  与**标准不确定度** `alpha_std_uncertainty`（同单位，`/K`、`ppm/K`、
+  `um/m/K` 三选一；α 不允许为负）。
+* 每个工况给**全局温度**或**逐尺寸温度覆盖**（两者合并须覆盖全部尺寸）：
+  * `fixed`：均值温度 + 标准不确定度 `std_uncertainty`（精确控温给 0）；
+  * `range`：温度区间 `[lower, upper]`，**下界 > 上界（倒置）拒绝**，
+    端点相等视为固定点；区间按硬边界处理（WC 取半宽，σ=h/√3，
+    独立均匀抽样，不参与温度相关传播）。
+* `alpha_correlations` / `temperature_correlations` 描述 u(α) 之间、
+  固定温度 u(T) 之间的 Pearson 相关，组装为相关矩阵并校验
+  取值范围、对称性与**半正定性**（与基线链同一口径）。
+* 温差在 °C 与 K 下数值相同；参考温度/工况温度可用开尔文提交。
+
+### 热态换算（L(T)=L0[1+α(T−T0)]）
+
+* 热态名义长度 `L0_nom·(1+αΔT)`、带中心 `(N+m)·(1+αΔT)`；
+  制造公差带与制造 σ **按同一比例等比缩放**，分布与基线相关结构不变。
+* 封闭环名义/均值按方向系数 s_i 求和（同基线口径）。
+* 热态不确定度做 GUM 一阶传播：
+  `∂L/∂α = L0ΔT`，`∂L/∂T = L0α`。
+
+### 每个工况返回的量
+
+* **均值与名义封闭环**、**极值边界**（制造半宽热态缩放；u(α) 与固定
+  u(T) 按 ±3σ 扩展；温度区间取硬半宽，各来源半宽相加）；
+* **RSS**：`σ²_C = σ²_制造 + σ²_膨胀系数 + σ²_温度`，逐尺寸 / 逐来源
+  方差贡献与占比，正态近似超差率（含单来源超差率）；
+* **固定种子蒙特卡洛**：`SeedSequence([seed, 0x74686572, 工况号]).spawn(4)`
+  派生制造 / α / 温度 / 完整非线性组合四个独立子流；组合样本按
+  `L=(L0+δ_制造)[1+(α+Δα)(ΔT+δT)]` 生成，另给三来源单独样本、
+  0.5/99.5% 分位、样本极值与经验超差率；
+* **汇总**：全工况最差超差率（WC/RSS/MC）、最小规格余量，以及
+  **最先越过规格的工况**（按提交顺序：WC 硬界越界优先，其次 RSS 超差，
+  再取余量最小者，附越界方向 lower/upper）。
+
+### 热整改方案搜索
+
+```bash
+curl -s -X POST localhost:8000/thermal-analyses/1/proposals \
+  -H 'Content-Type: application/json' -d @examples/thermal_proposal.json
+```
+
+* `candidates[]` 给候选材料（系数 α、u(α)、生效尺寸 `applies_to`、成本；
+  同一材料用于多个尺寸只计**一次**改动成本）；`shim_candidates[]` 给垫片
+  （名义厚度、厚度 σ、封闭环方向、成本；垫片在装配基准温度下定义，
+  所有工况相同）；`assembly_reference_temperatures[]` 给候选装配基准
+  温度（以 T_a 为公共零点重算 ΔT）。
+* `locked_materials` 锁定某尺寸只能用指定材料（锁定材料必须在候选表中
+  且 `applies_to` 覆盖该尺寸，否则 422）。
+* 系统枚举 材料 × 垫片 × 装配基准温度的笛卡尔积（含零成本现状），
+  先解析粗筛（组合数上限 20 000、解析上限 5 000），取前 40 个方案用
+  **与版本同源的固定种子 MC** 复核，按
+  **全工况最差 MC 超差率（升序）→ 全工况最小极值法规格余量（大者优先）
+  → 改动总成本（升序）** 排列；每个方案给材料系数、垫片厚度、
+  装配基准温度与成本拆分（材料 / 垫片 / 基准温度）。
+* 候选表与随机种子随结果冻结，重复搜索 / 读取结果不变。
+
 ## 校验拒绝（HTTP 422）
 
 * 名义值 ≤ 0；下偏差 > 上偏差；正态未给 σ；
@@ -366,7 +453,12 @@ curl -s -X POST localhost:8000/chains/1/assembly-tasks \
 * 装配任务：来源批次错链、池名重复、尺寸漏映射 / 重复映射 / 引用链外尺寸、
   装配数量超过最小池容量、跨批限制越界、同批组无共同批次、跨批限制为 1 但
   批次无交集、禁配引用不存在 / 缺测序号或禁配双方为各自池唯一实例；
-* 版本重排：锁定引用未知池 / 未覆盖全部池 / 重复锁定 / 锁定非合格组合。
+* 版本重排：锁定引用未知池 / 未覆盖全部池 / 重复锁定 / 锁定非合格组合；
+* 热分析：基线链未同时声明封闭环上下限、热参数漏填 / 链外 / 重复尺寸、
+  工况缺全局且未逐尺寸覆盖、工况名重复、温度区间下界 > 上界、α 为负、
+  α 或温度相关矩阵引用外尺寸 / 非半正定、1+αΔT ≤ 0 的非物理热膨胀；
+* 热整改方案：锁定材料不在候选表或不适用该尺寸、候选材料引用链外尺寸、
+  材料 × 垫片 × 基准温度组合数超过枚举上限。
 
 ## 测试
 
@@ -374,7 +466,7 @@ curl -s -X POST localhost:8000/chains/1/assembly-tasks \
 .venv/bin/python -m pytest -q
 ```
 
-122 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
+160 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
 WC/RSS 手算值核对、相关系数对 σ_C 的方向性影响、copula 蒙特卡洛、
 种子可复现性、方案分支不覆盖基线、批量调整与成本搜索、检验批次统计、
 测量方案合成不确定度手算核对、方案校验拒收（缺覆盖因子/负分量/
@@ -384,4 +476,11 @@ WC/RSS 手算值核对、相关系数对 σ_C 的方向性影响、copula 蒙特
 缺测排除 / 同批跨批禁配矛盾拒收、偏倚修正与实例内量具不确定度传播、
 保护带三态判定、固定保护带、实例与物理工件唯一性、分支定界解与穷举
 字典序最优一致（合格数优先于中心偏差）、无解受限池诊断、版本锁定累积 /
-重排 / 父版本不可变、快照冻结批次行+方案+种子与 MC 可复现。
+重排 / 父版本不可变、快照冻结批次行+方案+种子与 MC 可复现；温度热
+分析的漏填 / 倒置区间 / 非半正定矩阵 / 负 α / 无规格拒收、L(T) 热态
+名义与公差带缩放手算、制造 / 膨胀系数 / 温度三来源 RSS 方差分解、
+固定温度与温度区间口径、°C/K 温差等价、ppm/K 单位、相关 α 方向性、
+固定种子 MC 与解析 σ 一致及四子流可复现、最先越界工况、版本冻结重复
+GET 不变；热整改方案的材料 / 垫片 / 装配基准温度重基准化、材料成本
+去重、锁定材料限制、全工况最差超差率 + 余量 + 成本排序、组合数上限、
+固定种子方案结果冻结可复现。

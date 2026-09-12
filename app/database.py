@@ -5,6 +5,8 @@
 * scenarios          方案分支（属于某条链，永不覆盖基线）
 * measurement_plans  不可变测量方案（量具误差声明 + 合成结果）
 * inspection_batches 来料检验批次（冻结；可含测量方案快照与判定报告）
+* thermal_analyses   热分析版本（冻结基线之上的热参数 + 工况 + 结果）
+* thermal_proposals  热分析方案搜索结果（候选材料/垫片/基准温度，冻结）
 """
 from __future__ import annotations
 
@@ -144,6 +146,48 @@ class AssemblyVersionRow(Base):
     parent_version_id: Mapped[int | None] = mapped_column(
         Integer, nullable=True)
     name: Mapped[str] = mapped_column(String(200))
+    note: Mapped[str] = mapped_column(Text, default="")
+    request_json: Mapped[dict] = mapped_column(JSON)
+    result_json: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class ThermalAnalysisRow(Base):
+    """热分析版本：从冻结基线链建立，创建即冻结（基线不被覆盖）。"""
+
+    __tablename__ = "thermal_analyses"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(
+        ForeignKey("chains.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    # 原始请求（逐尺寸热参数 / 工况 / 相关矩阵原样冻结）
+    request_json: Mapped[dict] = mapped_column(JSON)
+    # 归一化热模型快照（T0 °C / α K^-1 / 工况温度）
+    model_json: Mapped[dict] = mapped_column(JSON)
+    # 创建时一次性算好的逐工况结果（含固定种子 MC）
+    result_json: Mapped[dict] = mapped_column(JSON)
+    mc_samples: Mapped[int] = mapped_column(Integer)
+    random_seed: Mapped[int] = mapped_column(Integer)
+    frozen: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class ThermalProposalRow(Base):
+    """热分析方案搜索结果：候选表 / 种子随请求冻结，重复读取结果不变。"""
+
+    __tablename__ = "thermal_proposals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    thermal_analysis_id: Mapped[int] = mapped_column(
+        ForeignKey("thermal_analyses.id", ondelete="CASCADE"), index=True
+    )
+    chain_id: Mapped[int] = mapped_column(
+        ForeignKey("chains.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
     note: Mapped[str] = mapped_column(Text, default="")
     request_json: Mapped[dict] = mapped_column(JSON)
     result_json: Mapped[dict] = mapped_column(JSON)
@@ -463,3 +507,97 @@ def list_assembly_tasks(chain_id: int) -> list[dict]:
                 ],
             })
         return out
+
+
+# ------------------------------------------------------------- 热分析 CRUD
+
+def save_thermal_analysis(chain_id: int, name: str, note: str,
+                          request: dict, model_snapshot: dict, result: dict,
+                          mc_samples: int, seed: int) -> int:
+    with session_factory() as s:
+        row = ThermalAnalysisRow(
+            chain_id=chain_id, name=name, note=note,
+            request_json=request, model_json=model_snapshot,
+            result_json=result, mc_samples=mc_samples, random_seed=seed,
+            frozen=1,
+        )
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def get_thermal_analysis(analysis_id: int) -> ThermalAnalysisRow | None:
+    with session_factory() as s:
+        row = s.get(ThermalAnalysisRow, analysis_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_thermal_analyses(chain_id: int) -> list[dict]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(ThermalAnalysisRow)
+            .where(ThermalAnalysisRow.chain_id == chain_id)
+            .order_by(ThermalAnalysisRow.id)
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "chain_id": r.chain_id,
+                "name": r.name,
+                "note": r.note,
+                "mc_samples": r.mc_samples,
+                "random_seed": r.random_seed,
+                "frozen": bool(r.frozen),
+                "conditions": [
+                    c["analytic"]["name"] for c in r.result_json["conditions"]
+                ],
+                "worst_reject_probability":
+                    r.result_json["summary"]["worst_reject_probability"],
+                "minimum_spec_margin_mm":
+                    r.result_json["summary"]["minimum_spec_margin_mm"],
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+def save_thermal_proposal(analysis_id: int, chain_id: int, name: str,
+                          note: str, request: dict, result: dict) -> int:
+    with session_factory() as s:
+        row = ThermalProposalRow(
+            thermal_analysis_id=analysis_id, chain_id=chain_id,
+            name=name, note=note, request_json=request, result_json=result)
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def get_thermal_proposal(proposal_id: int) -> ThermalProposalRow | None:
+    with session_factory() as s:
+        row = s.get(ThermalProposalRow, proposal_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_thermal_proposals(analysis_id: int) -> list[dict]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(ThermalProposalRow)
+            .where(ThermalProposalRow.thermal_analysis_id == analysis_id)
+            .order_by(ThermalProposalRow.id)
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "thermal_analysis_id": r.thermal_analysis_id,
+                "name": r.name,
+                "note": r.note,
+                "candidate_count": len(
+                    r.result_json.get("proposals", [])),
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]

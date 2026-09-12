@@ -5,6 +5,9 @@
 名义值、上下偏差、分布类型与标准差，并可声明尺寸间的相关系数；
 系统统一单位、校验模型有效性，同时给出**极值法 / RSS / 固定种子蒙特卡洛**
 三套结果，支持方案分支、批量对比与按成本搜索公差收紧组合。
+来料侧可建立**不可变测量方案**（量具分辨率/校准/偏倚/重复性四分量 +
+共用量具相关），检验批次引用后按 GUM 线性传播与固定种子蒙特卡洛
+评定扩展不确定度，以保护带给出接收/拒收/不确定判定。
 
 ## 快速开始
 
@@ -81,7 +84,9 @@ python3 -m venv --without-pip .venv        # 若 venv 自带 pip 可省略 get-p
 | POST | `/chains/{id}/batch-adjust` | 批量缩放公差带（可缩放 σ），存为分支并对比 |
 | GET | `/chains/{id}/scenarios` / `/scenarios/{sid}` | 分支列表 / 详情 |
 | POST | `/chains/{id}/cost-targets` | 按单位收紧成本搜索达到目标超差率的候选组合 |
-| POST | `/chains/{id}/inspection-batches` | 提交来料检验批次（IQC）：实测行复核基线，落库即冻结 |
+| POST | `/chains/{id}/measurement-plans` | 建立**不可变**测量方案（量具误差四分量 + 共用量具相关） |
+| GET | `/chains/{id}/measurement-plans` / `/measurement-plans/{pid}` | 方案列表 / 详情 |
+| POST | `/chains/{id}/inspection-batches` | 提交来料检验批次（IQC）：实测行复核基线，落库即冻结；可引用测量方案做量具误差判定 |
 | GET | `/chains/{id}/inspection-batches` | 该链下的检验批次列表 |
 | GET | `/inspection-batches/{bid}` | 读取冻结批次（报告创建时固化，多次读取不变） |
 
@@ -109,6 +114,12 @@ curl -s -X POST localhost:8000/chains/1/batch-adjust \
 # 5) 成本搜索：目标超差率 ≤ 1 ppm
 curl -s -X POST localhost:8000/chains/1/cost-targets \
   -H 'Content-Type: application/json' -d @examples/cost_target.json
+
+# 6) 测量方案 + 引用方案的检验批次（量具误差判定）
+curl -s -X POST localhost:8000/chains/1/measurement-plans \
+  -H 'Content-Type: application/json' -d @examples/measurement_plan.json
+curl -s -X POST localhost:8000/chains/1/inspection-batches \
+  -H 'Content-Type: application/json' -d @examples/inspection_batch_with_plan.json
 ```
 
 ### 成本模型
@@ -181,12 +192,77 @@ curl -s -X POST localhost:8000/chains/1/inspection-batches \
 逐尺寸样本数）、剔除原因与公式；`interpretation_note` 说明实测经验比例
 与基线模型概率口径不同，不可直接等同。
 
+## 测量方案与量具误差判定
+
+针对基线链建立**不可变测量方案**（示例 `examples/measurement_plan.json`），
+把量具误差纳入来料判定：
+
+```bash
+curl -s -X POST localhost:8000/chains/1/measurement-plans \
+  -H 'Content-Type: application/json' -d @examples/measurement_plan.json
+# 检验批次引用方案（保护带 w = 1×U，输出覆盖因子 k=2）
+curl -s -X POST localhost:8000/chains/1/inspection-batches \
+  -H 'Content-Type: application/json' -d @examples/inspection_batch_with_plan.json
+```
+
+### 方案建模（逐尺寸四分量，单位可混用，内部统一 mm）
+
+* `resolution`：分辨率 → `u_res = resolution/(2√3)`（半宽均匀分布）；
+* `calibration_expanded_uncertainty` + `coverage_factor`：校准证书
+  扩展不确定度 U 与覆盖因子 k，**必须成对给出**，`u_cal = U/k`；
+* `bias_correction`：偏倚修正值（带符号），判定前 `x_c = x + b`；
+* `bias_std_uncertainty`：该修正值的标准不确定度 `u_bias`；
+* `repeatability_std`：重复性标准差 `u_rep`；
+* `correlations`：共用量具带来的测量误差 Pearson 相关，作用于
+  `u_rest = √(u_cal²+u_bias²+u_rep²)` 公共误差源（分辨率量化误差相互独立）。
+
+合成标准不确定度 `u_c = √(u_res²+u_cal²+u_bias²+u_rep²)`。
+**拒绝保存（422）**：覆盖因子缺失或与 U 不成对、任一分量为负、
+相关矩阵非半正定、未恰好覆盖链上全部尺寸、相关项引用方案外尺寸。
+方案创建后不可修改；需要调整时另建新版本方案，历史批次引用不受影响。
+
+### 批次判定（`measurement` 报告）
+
+批次引用 `measurement_plan_id` 后，系统**先修正偏倚**（`x_c = x + b`），
+再用两套口径评定各实测值与封闭环的扩展不确定度 `U = k_out·u_c`
+（`output_coverage_factor`，默认 2）：
+
+* **GUM 线性传播**：封闭环
+  `u_C² = Σ s_i²u_res,i² + ΣΣ s_i s_j ρ_ij u_rest,i u_rest,j`；
+* **固定种子蒙特卡洛**：`ε_rest ~ N(0, DρD)`（Cholesky），
+  `ε_res,i ~ U(−res_i/2, res_i/2)` 独立，`X_true = x_c + ε`；
+  所有工件共用同一组误差样本，同一种子下整批判定可精确复现。
+
+**保护带** `guard_band`：`{"mode":"multiple","multiple":h}` 时 `w = h·U`；
+`{"mode":"fixed","fixed":…,"unit":…}` 时为固定长度。判定规则：
+
+| 区域 | 判定 |
+|---|---|
+| `LSL+w ≤ x_c ≤ USL−w` | 接收 `accept` |
+| `x_c < LSL−w` 或 `x_c > USL+w` | 拒收 `reject` |
+| 其余 | 不确定 `indeterminate` |
+
+每个判定项同时给出 **GUM 正态近似**与**蒙特卡洛经验比例**两套概率：
+接收时真值越界概率 `p_true_out_of_spec`、拒收时真值合格概率
+`p_true_conforming`。封闭环仅对测齐全部尺寸的工件行判定
+（缺测行列入 `excluded_serials`）；链未声明封闭环规格时只报告
+不确定度、不做接收判定。
+
+响应列明：逐尺寸**分量贡献**（`components_mm` / `variance_share`）、
+封闭环逐尺寸方差贡献、所用**公式**、**随机种子**与**依赖版本**
+（python/fastapi/pydantic/sqlalchemy/numpy）。**批次冻结方案快照**
+（`measurement.plan_snapshot`）：判定报告在创建时一次性算好存库，
+后续读取不变，新版本测量方案不改变历史判定。
+
 ## 校验拒绝（HTTP 422）
 
 * 名义值 ≤ 0；下偏差 > 上偏差；正态未给 σ；
 * 方向不闭合（报告各节点 出度−入度 不平衡量）；多环不连通；
 * 重复边、尺寸 id 重复；相关系数重复声明 / 引用不存在的尺寸；
-* 相关系数越界或相关矩阵非半正定（报告最小特征值）。
+* 相关系数越界或相关矩阵非半正定（报告最小特征值）；
+* 测量方案：覆盖因子缺失或与校准扩展不确定度不成对、不确定度分量为负、
+  量具相关矩阵非半正定、未恰好覆盖链上全部尺寸、相关项引用方案外尺寸；
+* 保护带：`mode=fixed` 未给固定长度、`mode=multiple` 误带 fixed、倍数为负。
 
 ## 测试
 
@@ -194,6 +270,9 @@ curl -s -X POST localhost:8000/chains/1/inspection-batches \
 .venv/bin/python -m pytest -q
 ```
 
-32 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
+81 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
 WC/RSS 手算值核对、相关系数对 σ_C 的方向性影响、copula 蒙特卡洛、
-种子可复现性、方案分支不覆盖基线、批量调整与成本搜索。
+种子可复现性、方案分支不覆盖基线、批量调整与成本搜索、检验批次统计、
+测量方案合成不确定度手算核对、方案校验拒收（覆盖因子缺失/负分量/
+非半正定）、偏倚修正与保护带判定、GUM 与蒙特卡洛概率对照、
+封闭环相关传播、方案快照冻结与新版本隔离。

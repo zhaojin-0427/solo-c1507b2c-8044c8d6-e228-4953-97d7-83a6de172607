@@ -310,6 +310,145 @@ class CostTargetRequest(BaseModel):
 ScenarioCreate.model_rebuild()
 
 
+# -------------------------------------------------------- 测量方案（量具误差）
+
+class GaugeInput(BaseModel):
+    """单个尺寸的量具误差声明（所有分量以 unit 计，内部换算为 mm）。
+
+    * resolution：量具分辨率，标准不确定度按半宽均匀分布 resolution/(2√3)；
+    * calibration_expanded_uncertainty + coverage_factor：校准证书扩展
+      不确定度 U 与覆盖因子 k，两者必须成对给出，u_cal = U/k；
+    * bias_correction：偏倚修正值（带符号，判定前加到实测值上）；
+    * bias_std_uncertainty：该修正值的标准不确定度；
+    * repeatability_std：重复性标准差。
+    """
+
+    dimension_id: str = Field(..., min_length=1)
+    unit: LengthUnit = LengthUnit.MM
+    resolution: float | None = Field(None, description="量具分辨率")
+    calibration_expanded_uncertainty: float | None = Field(
+        None, description="校准扩展不确定度 U"
+    )
+    coverage_factor: float | None = Field(
+        None, description="校准扩展不确定度的覆盖因子 k（随 U 必填）"
+    )
+    bias_correction: float | None = Field(
+        None, description="偏倚修正值（带符号， corrected = measured + 修正值）"
+    )
+    bias_std_uncertainty: float | None = Field(
+        None, description="偏倚修正值的标准不确定度"
+    )
+    repeatability_std: float | None = Field(None, description="重复性标准差")
+
+    @model_validator(mode="after")
+    def _check_components(self) -> "GaugeInput":
+        fields = (
+            "resolution", "calibration_expanded_uncertainty", "coverage_factor",
+            "bias_correction", "bias_std_uncertainty", "repeatability_std",
+        )
+        for f in fields:
+            v = getattr(self, f)
+            if v is not None and not math.isfinite(v):
+                raise ValueError(
+                    f"尺寸 {self.dimension_id}: 分量 {f} 必须为有限数，"
+                    f"收到 {v!r}"
+                )
+        negative = [
+            f for f in (
+                "resolution", "calibration_expanded_uncertainty",
+                "bias_std_uncertainty", "repeatability_std",
+            )
+            if getattr(self, f) is not None and getattr(self, f) < 0
+        ]
+        if negative:
+            detail = ", ".join(f"{f}={getattr(self, f)}" for f in negative)
+            raise ValueError(
+                f"尺寸 {self.dimension_id}: 不确定度分量不能为负: {detail}"
+            )
+        if self.coverage_factor is not None and self.coverage_factor <= 0:
+            raise ValueError(
+                f"尺寸 {self.dimension_id}: 覆盖因子必须为正，"
+                f"收到 {self.coverage_factor}"
+            )
+        u_cal = self.calibration_expanded_uncertainty
+        k = self.coverage_factor
+        if u_cal is not None and k is None:
+            raise ValueError(
+                f"尺寸 {self.dimension_id}: 已给校准扩展不确定度，"
+                "但覆盖因子缺失（u_cal = U/k 需要 k）"
+            )
+        if k is not None and u_cal is None:
+            raise ValueError(
+                f"尺寸 {self.dimension_id}: 已给覆盖因子，"
+                "但校准扩展不确定度缺失"
+            )
+        return self
+
+
+class MeasurementPlanCreate(BaseModel):
+    """针对基线链建立不可变测量方案：逐尺寸量具误差 + 共用量具相关项。"""
+
+    name: str = Field(..., min_length=1)
+    note: str = ""
+    gauges: list[GaugeInput] = Field(
+        ..., min_length=1, description="逐尺寸量具声明，必须恰好覆盖链上全部尺寸"
+    )
+    correlations: list[CorrelationSpec] = Field(
+        default_factory=list,
+        description="共用量具带来的测量误差相关系数（对称，提交一次即可）",
+    )
+
+    @model_validator(mode="after")
+    def _check_plan(self) -> "MeasurementPlanCreate":
+        ids = [g.dimension_id for g in self.gauges]
+        dup = sorted({i for i in ids if ids.count(i) > 1})
+        if dup:
+            raise ValueError(f"测量方案中尺寸重复声明: {dup}")
+        id_set = set(ids)
+        seen_pairs: set[frozenset[str]] = set()
+        for c in self.correlations:
+            if c.dim_a not in id_set or c.dim_b not in id_set:
+                raise ValueError(
+                    f"量具相关项引用了方案外的尺寸: {c.dim_a!r}, {c.dim_b!r}"
+                )
+            key = frozenset((c.dim_a, c.dim_b))
+            if key in seen_pairs:
+                raise ValueError(
+                    f"尺寸 {c.dim_a} 与 {c.dim_b} 的量具相关重复声明"
+                )
+            seen_pairs.add(key)
+        # 相关矩阵必须半正定（与基线链同一校验口径）
+        ChainCreate._check_psd(ids, self.correlations)
+        return self
+
+
+class GuardBandSpec(BaseModel):
+    """保护带设置：按扩展不确定度倍数（multiple）或固定长度（fixed）。"""
+
+    mode: Literal["multiple", "fixed"] = "multiple"
+    multiple: float = Field(
+        1.0, ge=0, description="mode=multiple 时 w = multiple × 扩展不确定度 U"
+    )
+    fixed: float | None = Field(
+        None, ge=0, description="mode=fixed 时的固定保护带长度（按 unit 计）"
+    )
+    unit: LengthUnit = LengthUnit.MM
+
+    @model_validator(mode="after")
+    def _check(self) -> "GuardBandSpec":
+        if not math.isfinite(self.multiple):
+            raise ValueError("保护带倍数必须为有限数")
+        if self.fixed is not None and not math.isfinite(self.fixed):
+            raise ValueError("固定保护带长度必须为有限数")
+        if self.mode == "fixed" and self.fixed is None:
+            raise ValueError("保护带 mode=fixed 时必须给出固定长度 fixed")
+        if self.mode == "multiple" and self.fixed is not None:
+            raise ValueError(
+                "保护带 mode=multiple 时不接受 fixed；如需固定长度请用 mode=fixed"
+            )
+        return self
+
+
 # -------------------------------------------------------- 来料检验批次
 
 class MeasurementInput(BaseModel):
@@ -354,7 +493,12 @@ class BatchRowInput(BaseModel):
 
 
 class InspectionBatchCreate(BaseModel):
-    """创建来料检验批次：选定基线链，逐工件行提交实测值。"""
+    """创建来料检验批次：选定基线链，逐工件行提交实测值。
+
+    可选引用测量方案（measurement_plan_id）：引用后先按方案修正偏倚，
+    再对修正值做 GUM 线性传播与固定种子蒙特卡洛不确定度评定，
+    按保护带给出接收 / 拒收 / 不确定判定。
+    """
 
     name: str = Field(..., min_length=1)
     note: str = ""
@@ -366,4 +510,21 @@ class InspectionBatchCreate(BaseModel):
     )
     random_seed: int = Field(
         20260911, ge=0, description="bootstrap 固定随机种子"
+    )
+    # ---- 量具误差判定（可选，引用测量方案后生效）----
+    measurement_plan_id: int | None = Field(
+        None, ge=1, description="引用的测量方案 id（属于同一基线链）"
+    )
+    output_coverage_factor: float = Field(
+        2.0, gt=0, description="输出扩展不确定度的覆盖因子 k_out（U=k_out·u_c）"
+    )
+    guard_band: GuardBandSpec | None = Field(
+        None, description="保护带设置；缺省为 mode=multiple, multiple=1.0"
+    )
+    measurement_mc_samples: int = Field(
+        100_000, ge=1_000, le=1_000_000,
+        description="测量误差蒙特卡洛样本数（所有工件共用一组误差样本）",
+    )
+    measurement_mc_seed: int = Field(
+        20260912, ge=0, description="测量误差蒙特卡洛固定随机种子"
     )

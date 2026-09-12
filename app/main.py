@@ -26,6 +26,7 @@ from .engine import (
     normalize_chain,
 )
 from .inspection import analyze_batch, baseline_comparison, validate_rows
+from .measurement import evaluate_batch, normalize_plan
 from .optimizer import search_cost_targets
 from .scenarios import (
     apply_batch_adjust,
@@ -38,7 +39,9 @@ from .schemas import (
     ChainCreate,
     CostTargetRequest,
     GapProbabilityRequest,
+    GuardBandSpec,
     InspectionBatchCreate,
+    MeasurementPlanCreate,
     ScenarioCreate,
 )
 from .units import to_mm
@@ -359,6 +362,59 @@ def cost_targets(chain_id: int, payload: CostTargetRequest) -> dict:
     return answer
 
 
+# -------------------------------------------------------- 测量方案
+
+@app.post("/chains/{chain_id}/measurement-plans", status_code=201,
+          tags=["measurement"])
+def create_measurement_plan(chain_id: int, payload: MeasurementPlanCreate) -> dict:
+    """建立不可变测量方案：逐尺寸量具误差 + 共用量具相关项。
+
+    统一单位为 mm 后合成标准不确定度；覆盖因子缺失、分量为负、
+    相关矩阵非半正定、未覆盖链上全部尺寸时拒绝保存（422）。
+    方案创建后不可修改，新版本请另建方案（历史批次引用不受影响）。
+    """
+    row = _load_chain(chain_id)
+    nc = rebuild_normalized(row.request_json)
+    try:
+        combined = normalize_plan(nc, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    plan_id = db.save_measurement_plan(
+        chain_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), combined,
+    )
+    return {
+        "plan_id": plan_id,
+        "chain_id": chain_id,
+        "name": payload.name,
+        "immutable": True,
+        "plan": combined,
+    }
+
+
+@app.get("/chains/{chain_id}/measurement-plans", tags=["measurement"])
+def list_measurement_plans(chain_id: int) -> dict:
+    _load_chain(chain_id)
+    return {"chain_id": chain_id, "plans": db.list_measurement_plans(chain_id)}
+
+
+@app.get("/measurement-plans/{plan_id}", tags=["measurement"])
+def get_measurement_plan(plan_id: int) -> dict:
+    row = db.get_measurement_plan(plan_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"测量方案 {plan_id} 不存在")
+    return {
+        "plan_id": row.id,
+        "chain_id": row.chain_id,
+        "name": row.name,
+        "note": row.note,
+        "immutable": True,
+        "created_at": row.created_at.isoformat(),
+        "submitted_input": row.request_json,
+        "plan": row.combined_json,
+    }
+
+
 # -------------------------------------------------------- 来料检验批次
 
 def _serialized_rows(payload: InspectionBatchCreate) -> list[dict]:
@@ -385,10 +441,12 @@ def _batch_response(row) -> dict:
         "frozen": bool(row.frozen),
         "bootstrap_samples": row.bootstrap_samples,
         "random_seed": row.random_seed,
+        "measurement_plan_id": row.measurement_plan_id,
         "created_at": row.created_at.isoformat(),
         "rows": row.rows_json,
         "report": row.report_json,
         "baseline_comparison": row.comparison_json,
+        "measurement": row.measurement_json,
     }
 
 
@@ -398,7 +456,10 @@ def create_inspection_batch(chain_id: int, payload: InspectionBatchCreate) -> di
     """创建来料检验批次：复核链外尺寸/重复序号/非有限值/未知单位后冻结入库。
 
     缺测可入库（响应 report.gaps 列出每个工件的缺口）；批次落库后不可修改，
-    后续测量应另建批次。
+    后续测量应另建批次。引用 measurement_plan_id 时：先按方案修正偏倚，
+    再用 GUM 线性传播与固定种子蒙特卡洛评定各实测值与封闭环的扩展不确定度，
+    按保护带给出接收/拒收/不确定判定及真值越界/合格概率；
+    方案快照随批次冻结，后续新版本方案不改变本批判定。
     """
     chain_row = _load_chain(chain_id)
     nc = rebuild_normalized(chain_row.request_json)
@@ -407,6 +468,34 @@ def create_inspection_batch(chain_id: int, payload: InspectionBatchCreate) -> di
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    measurement = None
+    plan_id = payload.measurement_plan_id
+    if plan_id is not None:
+        plan_row = db.get_measurement_plan(plan_id)
+        if plan_row is None or plan_row.chain_id != chain_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"链 {chain_id} 下测量方案 {plan_id} 不存在",
+            )
+        gb = payload.guard_band or GuardBandSpec()
+        measurement = evaluate_batch(
+            nc,
+            plan_row.combined_json,
+            rows,
+            plan_meta={"plan_id": plan_row.id, "name": plan_row.name,
+                       "note": plan_row.note},
+            k_out=payload.output_coverage_factor,
+            guard_band={
+                "mode": gb.mode,
+                "multiple": gb.multiple,
+                "fixed_mm": (to_mm(gb.fixed, gb.unit.value)
+                             if gb.fixed is not None else None),
+                "submitted": gb.model_dump(mode="json"),
+            },
+            mc_samples=payload.measurement_mc_samples,
+            seed=payload.measurement_mc_seed,
+        )
+
     report = analyze_batch(
         nc, rows, payload.bootstrap_samples, payload.random_seed)
     comparison = baseline_comparison(nc, chain_row.result_json, report)
@@ -414,6 +503,7 @@ def create_inspection_batch(chain_id: int, payload: InspectionBatchCreate) -> di
     batch_id = db.save_inspection_batch(
         chain_id, payload.name, payload.note, stored_rows, report,
         comparison, payload.bootstrap_samples, payload.random_seed,
+        measurement_plan_id=plan_id, measurement=measurement,
     )
     saved = db.get_inspection_batch(batch_id)
     return _batch_response(saved)

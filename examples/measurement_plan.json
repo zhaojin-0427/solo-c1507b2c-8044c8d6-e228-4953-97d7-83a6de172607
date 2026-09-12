@@ -1,0 +1,39 @@
+{
+  "name": "caliper-cmm-set-v1",
+  "note": "L1/L3 共用同一把数显卡尺（校准相关 0.6）；L2 用千分尺。分辨率/校准/偏倚/重复性四分量和成",
+  "gauges": [
+    {
+      "dimension_id": "L1",
+      "unit": "mm",
+      "resolution": 0.01,
+      "calibration_expanded_uncertainty": 0.004,
+      "coverage_factor": 2.0,
+      "bias_correction": 0.002,
+      "bias_std_uncertainty": 0.001,
+      "repeatability_std": 0.003
+    },
+    {
+      "dimension_id": "L2",
+      "unit": "mm",
+      "resolution": 0.005,
+      "calibration_expanded_uncertainty": 0.003,
+      "coverage_factor": 2.0,
+      "bias_correction": 0.0,
+      "bias_std_uncertainty": 0.0005,
+      "repeatability_std": 0.002
+    },
+    {
+      "dimension_id": "L3",
+      "unit": "mm",
+      "resolution": 0.01,
+      "calibration_expanded_uncertainty": 0.006,
+      "coverage_factor": 2.0,
+      "bias_correction": -0.001,
+      "bias_std_uncertainty": 0.0015,
+      "repeatability_std": 0.004
+    }
+  ],
+  "correlations": [
+    {"dim_a": "L1", "dim_b": "L3", "rho": 0.6}
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "name": "2026-W37-lot-A-gauged",
+  "note": "引用测量方案 1：偏倚修正后按保护带 w=1×U(k=2) 判定",
+  "measurement_plan_id": 1,
+  "output_coverage_factor": 2.0,
+  "guard_band": {"mode": "multiple", "multiple": 1.0},
+  "measurement_mc_samples": 100000,
+  "measurement_mc_seed": 20260912,
+  "bootstrap_samples": 10000,
+  "random_seed": 20260911,
+  "rows": [
+    {"serial": "W001", "measurements": [
+      {"dimension_id": "L1", "value": 50.046, "unit": "mm"},
+      {"dimension_id": "L2", "value": 30.302, "unit": "mm"},
+      {"dimension_id": "L3", "value": 79.981, "unit": "mm"}
+    ]},
+    {"serial": "W002", "measurements": [
+      {"dimension_id": "L1", "value": 50.051, "unit": "mm"},
+      {"dimension_id": "L2", "value": 1.193, "unit": "in"},
+      {"dimension_id": "L3", "value": 80.012, "unit": "mm"}
+    ]},
+    {"serial": "W003", "measurements": [
+      {"dimension_id": "L1", "value": 50.006, "unit": "mm"},
+      {"dimension_id": "L2", "value": 30.298, "unit": "mm"},
+      {"dimension_id": "L3", "value": 80.005, "unit": "mm"}
+    ]},
+    {"serial": "W004", "measurements": [
+      {"dimension_id": "L1", "value": 49.985, "unit": "mm"},
+      {"dimension_id": "L2", "value": 30.311, "unit": "mm"},
+      {"dimension_id": "L3", "value": 79.990, "unit": "mm"}
+    ]}
+  ]
+}

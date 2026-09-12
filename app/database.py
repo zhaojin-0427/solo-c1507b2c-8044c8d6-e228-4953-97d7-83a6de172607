@@ -1,9 +1,10 @@
 """SQLite 持久层（SQLAlchemy Core + ORM）。
 
 存储：
-* chains        基线尺寸链（输入 + 规范化 + 结果 JSON）
-* scenarios     方案分支（属于某条链，永不覆盖基线）
-* scenario_runs 方案/批量调整的每次计算结果（便于追溯）
+* chains             基线尺寸链（输入 + 规范化 + 结果 JSON）
+* scenarios          方案分支（属于某条链，永不覆盖基线）
+* measurement_plans  不可变测量方案（量具误差声明 + 合成结果）
+* inspection_batches 来料检验批次（冻结；可含测量方案快照与判定报告）
 """
 from __future__ import annotations
 
@@ -66,6 +67,23 @@ class ScenarioRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+class MeasurementPlanRow(Base):
+    """不可变测量方案：创建后只允许读取，新版本另建行。"""
+
+    __tablename__ = "measurement_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(
+        ForeignKey("chains.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    # 原始请求与规范化合成结果（mm）
+    request_json: Mapped[dict] = mapped_column(JSON)
+    combined_json: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 class InspectionBatchRow(Base):
     """来料检验批次：创建后即冻结，只允许读取。"""
 
@@ -84,11 +102,33 @@ class InspectionBatchRow(Base):
     comparison_json: Mapped[dict] = mapped_column(JSON)
     bootstrap_samples: Mapped[int] = mapped_column(Integer)
     random_seed: Mapped[int] = mapped_column(Integer)
+    # 量具误差判定：引用的测量方案与冻结的判定报告（含方案快照）
+    measurement_plan_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True)
+    measurement_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     frozen: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 _engine: Any = None
+
+
+def _migrate(engine) -> None:
+    """旧库轻量迁移：inspection_batches 补测量方案相关列。"""
+    from sqlalchemy import inspect, text
+
+    cols = {c["name"] for c in inspect(engine).get_columns("inspection_batches")}
+    with engine.begin() as conn:
+        if "measurement_plan_id" not in cols:
+            conn.execute(text(
+                "ALTER TABLE inspection_batches "
+                "ADD COLUMN measurement_plan_id INTEGER"
+            ))
+        if "measurement_json" not in cols:
+            conn.execute(text(
+                "ALTER TABLE inspection_batches "
+                "ADD COLUMN measurement_json JSON"
+            ))
 
 
 def get_engine():
@@ -99,6 +139,7 @@ def get_engine():
             echo=False,
         )
         Base.metadata.create_all(_engine)
+        _migrate(_engine)
     return _engine
 
 
@@ -191,16 +232,61 @@ def list_scenarios(chain_id: int) -> list[dict]:
         ]
 
 
+# ------------------------------------------------------- 测量方案 CRUD
+
+def save_measurement_plan(chain_id: int, name: str, note: str,
+                          request: dict, combined: dict) -> int:
+    with session_factory() as s:
+        row = MeasurementPlanRow(
+            chain_id=chain_id, name=name, note=note,
+            request_json=request, combined_json=combined,
+        )
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def get_measurement_plan(plan_id: int) -> MeasurementPlanRow | None:
+    with session_factory() as s:
+        row = s.get(MeasurementPlanRow, plan_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_measurement_plans(chain_id: int) -> list[dict]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(MeasurementPlanRow)
+            .where(MeasurementPlanRow.chain_id == chain_id)
+            .order_by(MeasurementPlanRow.id)
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "chain_id": r.chain_id,
+                "name": r.name,
+                "note": r.note,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
 # ------------------------------------------------------- 来料检验批次 CRUD
 
 def save_inspection_batch(chain_id: int, name: str, note: str,
                           rows: list[dict], report: dict, comparison: dict,
-                          bootstrap_samples: int, seed: int) -> int:
+                          bootstrap_samples: int, seed: int,
+                          measurement_plan_id: int | None = None,
+                          measurement: dict | None = None) -> int:
     with session_factory() as s:
         row = InspectionBatchRow(
             chain_id=chain_id, name=name, note=note,
             rows_json=rows, report_json=report, comparison_json=comparison,
             bootstrap_samples=bootstrap_samples, random_seed=seed, frozen=1,
+            measurement_plan_id=measurement_plan_id,
+            measurement_json=measurement,
         )
         s.add(row)
         s.commit()
@@ -230,6 +316,7 @@ def list_inspection_batches(chain_id: int) -> list[dict]:
                 "note": r.note,
                 "bootstrap_samples": r.bootstrap_samples,
                 "random_seed": r.random_seed,
+                "measurement_plan_id": r.measurement_plan_id,
                 "frozen": bool(r.frozen),
                 "rows_total": len(r.rows_json),
                 "complete_rows": r.report_json["sample_summary"]["complete_rows"],

@@ -1,0 +1,24 @@
+{
+  "name": "grr-L1-caliper",
+  "note": "L1 数显卡尺：3 零件 × 2 操作者 × 2 轮，过程公差 0.1mm",
+  "dimension_id": "L1",
+  "unit": "mm",
+  "process_tolerance": 0.1,
+  "measurements": [
+    {"part": "P1", "operator": "A", "replicate": 1, "value": 10.00},
+    {"part": "P1", "operator": "A", "replicate": 2, "value": 10.02},
+    {"part": "P1", "operator": "B", "replicate": 1, "value": 10.01},
+    {"part": "P1", "operator": "B", "replicate": 2, "value": 10.03},
+    {"part": "P2", "operator": "A", "replicate": 1, "value": 10.10},
+    {"part": "P2", "operator": "A", "replicate": 2, "value": 10.12},
+    {"part": "P2", "operator": "B", "replicate": 1, "value": 10.11},
+    {"part": "P2", "operator": "B", "replicate": 2, "value": 10.13},
+    {"part": "P3", "operator": "A", "replicate": 1, "value": 9.90},
+    {"part": "P3", "operator": "A", "replicate": 2, "value": 9.92},
+    {"part": "P3", "operator": "B", "replicate": 1, "value": 9.91},
+    {"part": "P3", "operator": "B", "replicate": 2, "value": 9.93}
+  ],
+  "study_variation_multiplier": 5.15,
+  "bootstrap_samples": 10000,
+  "random_seed": 20260915
+}

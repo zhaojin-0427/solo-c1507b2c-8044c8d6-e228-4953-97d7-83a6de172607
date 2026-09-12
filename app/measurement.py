@@ -7,7 +7,8 @@
 * u_res  = resolution/(2√3)   分辨率：半宽 resolution/2 的均匀分布
 * u_cal  = U_cal / k          校准扩展不确定度除以其覆盖因子
 * u_bias                      偏倚修正值的标准不确定度
-* u_rep                       重复性标准差
+* u_rep                       重复性标准差（可引用冻结量具 R&R 研究，
+                              以总量具标准差 σ_GRR 取代手填值）
 * u_c    = √(u_res² + u_cal² + u_bias² + u_rep²)
 
 偏倚修正：x_c = x + b（b 为带符号修正值，修正后残余误差视为零均值）。
@@ -103,12 +104,19 @@ def dependency_versions() -> dict[str, str]:
 
 # ------------------------------------------------------------- 方案合成
 
-def normalize_plan(nc: NormalizedChain, payload) -> dict[str, Any]:
+def normalize_plan(nc: NormalizedChain, payload,
+                   gage_rr: dict[str, dict[str, Any]] | None = None
+                   ) -> dict[str, Any]:
     """校验测量方案对基线链的覆盖性，统一单位为 mm 并合成标准不确定度。
 
     分量符号 / 覆盖因子配对 / 相关矩阵半正定已由 Pydantic 拦截；
     这里复核链尺寸覆盖（缺失、链外）并组装规范化结果。
+
+    gage_rr：尺寸 id -> {"study_id", "name", "total_gage_std_mm"}，
+    被引用尺寸的重复性分量 u_rep 以冻结量具 R&R 研究的总量具标准差
+    取代手填值（研究 id 随方案快照冻结）。
     """
+    gage_rr = gage_rr or {}
     chain_ids = [d.id for d in nc.dimensions]
     gauge_by_id = {g.dimension_id: g for g in payload.gauges}
     missing = [i for i in chain_ids if i not in gauge_by_id]
@@ -117,6 +125,11 @@ def normalize_plan(nc: NormalizedChain, payload) -> dict[str, Any]:
     external = sorted(set(gauge_by_id) - set(chain_ids))
     if external:
         raise ValueError(f"测量方案包含基线链之外的尺寸: {external}")
+    external_rr = sorted(set(gage_rr) - set(chain_ids))
+    if external_rr:
+        raise ValueError(
+            f"量具 R&R 研究引用了基线链之外的尺寸: {external_rr}"
+        )
 
     # 相关矩阵（链尺寸顺序；schema 已校验半正定，这里防御性复核）
     idx = {name: i for i, name in enumerate(chain_ids)}
@@ -148,10 +161,26 @@ def normalize_plan(nc: NormalizedChain, payload) -> dict[str, Any]:
             to_mm(g.bias_std_uncertainty, u)
             if g.bias_std_uncertainty is not None else 0.0
         )
-        u_rep = (
+        u_rep_manual = (
             to_mm(g.repeatability_std, u)
             if g.repeatability_std is not None else 0.0
         )
+        # 引用冻结量具 R&R 研究：重复性分量以研究的总量具标准差取代手填值
+        rr = gage_rr.get(d.id)
+        if rr is not None:
+            u_rep = float(rr["total_gage_std_mm"])
+            repeatability_source: dict[str, Any] = {
+                "type": "gage_rr_study",
+                "study_id": rr["study_id"],
+                "study_name": rr["name"],
+                "total_gage_std_mm": u_rep,
+                "replaced_submitted_repeatability_std_mm": u_rep_manual,
+                "note": "重复性分量由冻结量具 R&R 研究的总量具标准差"
+                        "（含再现性）取代手填值；研究 id 随方案快照冻结",
+            }
+        else:
+            u_rep = u_rep_manual
+            repeatability_source = {"type": "manual"}
         u_rest = math.sqrt(u_cal ** 2 + u_bias ** 2 + u_rep ** 2)
         var = u_res ** 2 + u_rest ** 2
         u_comb = math.sqrt(var)
@@ -180,6 +209,7 @@ def normalize_plan(nc: NormalizedChain, payload) -> dict[str, Any]:
                 "u_bias": u_bias,
                 "u_repeatability": u_rep,
             },
+            "repeatability_source": repeatability_source,
             "u_rest_mm": u_rest,
             "combined_std_uncertainty_mm": u_comb,
             "variance_share": {
@@ -194,6 +224,16 @@ def normalize_plan(nc: NormalizedChain, payload) -> dict[str, Any]:
         "unit_policy": "所有分量按声明单位换算为 mm 后合成；"
                        "原始数值与单位在 submitted 中原样保留",
         "dimensions": dims_out,
+        "gage_rr_studies": [
+            {
+                "dimension_id": dim_id,
+                "study_id": gage_rr[dim_id]["study_id"],
+                "study_name": gage_rr[dim_id]["name"],
+                "total_gage_std_mm": float(
+                    gage_rr[dim_id]["total_gage_std_mm"]),
+            }
+            for dim_id in chain_ids if dim_id in gage_rr
+        ],
         "correlation": {
             "matrix": corr.tolist(),
             "dimension_order": chain_ids,

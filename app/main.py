@@ -26,6 +26,7 @@ from .engine import (
     gap_probability,
     normalize_chain,
 )
+from .gage_rr import run_study
 from .inspection import analyze_batch, baseline_comparison, validate_rows
 from .measurement import evaluate_batch, normalize_plan
 from .optimizer import search_cost_targets
@@ -41,6 +42,7 @@ from .schemas import (
     BatchAdjustRequest,
     ChainCreate,
     CostTargetRequest,
+    GageRrStudyCreate,
     GapProbabilityRequest,
     GuardBandSpec,
     InspectionBatchCreate,
@@ -368,6 +370,72 @@ def cost_targets(chain_id: int, payload: CostTargetRequest) -> dict:
     return answer
 
 
+# -------------------------------------------------------- 量具 R&R 研究
+
+def _study_response(row) -> dict:
+    return {
+        "study_id": row.id,
+        "chain_id": row.chain_id,
+        "dimension_id": row.dimension_id,
+        "name": row.name,
+        "note": row.note,
+        "frozen": bool(row.frozen),
+        "bootstrap_samples": row.bootstrap_samples,
+        "random_seed": row.random_seed,
+        "created_at": row.created_at.isoformat(),
+        "submitted_input": row.request_json,
+        "result": row.result_json,
+    }
+
+
+@app.post("/chains/{chain_id}/gage-rr-studies", status_code=201,
+          tags=["gage-rr"])
+def create_gage_rr_study(chain_id: int, payload: GageRrStudyCreate) -> dict:
+    """对链上某一尺寸建立量具 R&R 研究（双因素随机效应 ANOVA，创建即冻结）。
+
+    提交 零件×操作者×重复 的完整平衡交叉表（至少 2 零件 × 2 操作者 ×
+    2 轮重复，每个零件由所有操作者等次数测量）、单位与过程公差；
+    未知尺寸、重复单元、交叉表缺口或重复次数不齐拒绝创建（422）并指出缺口。
+    系统拆分设备重复性、操作者再现性、零件×操作者交互与零件间方差
+    （负方差分量截为零并保留原估计），返回总量具 R&R、方差占比、
+    %Study Variation、%Tolerance、ndc，以及固定种子 bootstrap 95% 置信
+    区间与主要变差来源。研究创建后不可修改，历史研究不改写。
+    """
+    row = _load_chain(chain_id)
+    nc = rebuild_normalized(row.request_json)
+    chain_ids = [d.id for d in nc.dimensions]
+    if payload.dimension_id not in chain_ids:
+        raise HTTPException(
+            status_code=422,
+            detail=f"尺寸 {payload.dimension_id!r} 不在基线链 {chain_id} 上"
+                   f"（未知尺寸）；链上尺寸: {chain_ids}",
+        )
+    result = run_study(payload)
+    study_id = db.save_gage_rr_study(
+        chain_id, payload.dimension_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), result,
+        payload.bootstrap_samples, payload.random_seed)
+    saved = db.get_gage_rr_study(study_id)
+    return _study_response(saved)
+
+
+@app.get("/chains/{chain_id}/gage-rr-studies", tags=["gage-rr"])
+def list_gage_rr_studies(chain_id: int) -> dict:
+    _load_chain(chain_id)
+    return {"chain_id": chain_id,
+            "studies": db.list_gage_rr_studies(chain_id)}
+
+
+@app.get("/gage-rr-studies/{study_id}", tags=["gage-rr"])
+def get_gage_rr_study(study_id: int) -> dict:
+    """读取冻结研究：结果创建时固化，多次读取内容不变。"""
+    row = db.get_gage_rr_study(study_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"量具 R&R 研究 {study_id} 不存在")
+    return _study_response(row)
+
+
 # -------------------------------------------------------- 测量方案
 
 @app.post("/chains/{chain_id}/measurement-plans", status_code=201,
@@ -377,12 +445,34 @@ def create_measurement_plan(chain_id: int, payload: MeasurementPlanCreate) -> di
 
     统一单位为 mm 后合成标准不确定度；覆盖因子缺失、分量为负、
     相关矩阵非半正定、未覆盖链上全部尺寸时拒绝保存（422）。
+    可选 gage_rr_studies 引用冻结量具 R&R 研究：该尺寸的重复性分量
+    以研究的总量具标准差取代手填值（其余量具参数仍须补齐），
+    研究 id 随方案快照冻结；研究错链 / 不存在 / 尺寸不匹配时拒绝。
     方案创建后不可修改，新版本请另建方案（历史批次引用不受影响）。
     """
     row = _load_chain(chain_id)
     nc = rebuild_normalized(row.request_json)
+    gage_rr_refs: dict[str, dict] = {}
+    for dim_id, study_id in payload.gage_rr_studies.items():
+        srow = db.get_gage_rr_study(study_id)
+        if srow is None or srow.chain_id != chain_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"链 {chain_id} 下量具 R&R 研究 {study_id} 不存在",
+            )
+        if srow.dimension_id != dim_id:
+            raise HTTPException(
+                status_code=422,
+                detail=f"量具 R&R 研究 {study_id} 针对尺寸 "
+                       f"{srow.dimension_id!r}，不能用于尺寸 {dim_id!r}",
+            )
+        gage_rr_refs[dim_id] = {
+            "study_id": srow.id,
+            "name": srow.name,
+            "total_gage_std_mm": srow.result_json["total_gage_std_mm"],
+        }
     try:
-        combined = normalize_plan(nc, payload)
+        combined = normalize_plan(nc, payload, gage_rr=gage_rr_refs)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     plan_id = db.save_measurement_plan(

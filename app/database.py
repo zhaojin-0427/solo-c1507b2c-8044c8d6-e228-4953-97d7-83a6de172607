@@ -7,6 +7,7 @@
 * inspection_batches 来料检验批次（冻结；可含测量方案快照与判定报告）
 * thermal_analyses   热分析版本（冻结基线之上的热参数 + 工况 + 结果）
 * thermal_proposals  热分析方案搜索结果（候选材料/垫片/基准温度，冻结）
+* gage_rr_studies    量具 R&R 研究（单尺寸 ANOVA 交叉表 + 结果，冻结）
 """
 from __future__ import annotations
 
@@ -191,6 +192,27 @@ class ThermalProposalRow(Base):
     note: Mapped[str] = mapped_column(Text, default="")
     request_json: Mapped[dict] = mapped_column(JSON)
     result_json: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class GageRrStudyRow(Base):
+    """量具 R&R 研究：创建即冻结（交叉表、ANOVA 结果与 bootstrap 配置固化）。"""
+
+    __tablename__ = "gage_rr_studies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(
+        ForeignKey("chains.id", ondelete="CASCADE"), index=True
+    )
+    dimension_id: Mapped[str] = mapped_column(String(200), index=True)
+    name: Mapped[str] = mapped_column(String(200), index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    # 原始请求（交叉表 / 单位 / 过程公差原样冻结）与创建时算好的完整结果
+    request_json: Mapped[dict] = mapped_column(JSON)
+    result_json: Mapped[dict] = mapped_column(JSON)
+    bootstrap_samples: Mapped[int] = mapped_column(Integer)
+    random_seed: Mapped[int] = mapped_column(Integer)
+    frozen: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
@@ -597,6 +619,56 @@ def list_thermal_proposals(analysis_id: int) -> list[dict]:
                 "note": r.note,
                 "candidate_count": len(
                     r.result_json.get("proposals", [])),
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+# ------------------------------------------------------- 量具 R&R 研究 CRUD
+
+def save_gage_rr_study(chain_id: int, dimension_id: str, name: str, note: str,
+                       request: dict, result: dict,
+                       bootstrap_samples: int, seed: int) -> int:
+    with session_factory() as s:
+        row = GageRrStudyRow(
+            chain_id=chain_id, dimension_id=dimension_id, name=name,
+            note=note, request_json=request, result_json=result,
+            bootstrap_samples=bootstrap_samples, random_seed=seed, frozen=1,
+        )
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def get_gage_rr_study(study_id: int) -> GageRrStudyRow | None:
+    with session_factory() as s:
+        row = s.get(GageRrStudyRow, study_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_gage_rr_studies(chain_id: int) -> list[dict]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(GageRrStudyRow)
+            .where(GageRrStudyRow.chain_id == chain_id)
+            .order_by(GageRrStudyRow.id)
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "chain_id": r.chain_id,
+                "dimension_id": r.dimension_id,
+                "name": r.name,
+                "note": r.note,
+                "bootstrap_samples": r.bootstrap_samples,
+                "random_seed": r.random_seed,
+                "frozen": bool(r.frozen),
+                "total_gage_std_mm": r.result_json["total_gage_std_mm"],
+                "ndc": r.result_json["ndc"],
+                "dominant_source": r.result_json["dominant_source"]["component"],
                 "created_at": r.created_at.isoformat(),
             }
             for r in rows

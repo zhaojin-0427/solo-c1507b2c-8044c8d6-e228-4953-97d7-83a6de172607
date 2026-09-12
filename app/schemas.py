@@ -393,7 +393,11 @@ class GaugeInput(BaseModel):
 
 
 class MeasurementPlanCreate(BaseModel):
-    """针对基线链建立不可变测量方案：逐尺寸量具误差 + 共用量具相关项。"""
+    """针对基线链建立不可变测量方案：逐尺寸量具误差 + 共用量具相关项。
+
+    可选 ``gage_rr_studies``：尺寸 id -> 冻结量具 R&R 研究 id，该尺寸的
+    重复性分量以研究的总量具标准差取代（其余量具参数仍须照常填写）。
+    """
 
     name: str = Field(..., min_length=1)
     note: str = ""
@@ -404,6 +408,11 @@ class MeasurementPlanCreate(BaseModel):
         default_factory=list,
         description="共用量具带来的测量误差相关系数（对称，提交一次即可）",
     )
+    gage_rr_studies: dict[str, int] = Field(
+        default_factory=dict,
+        description="尺寸 id -> 冻结量具 R&R 研究 id；该尺寸的重复性分量"
+                    "以研究的总量具标准差取代手填值",
+    )
 
     @model_validator(mode="after")
     def _check_plan(self) -> "MeasurementPlanCreate":
@@ -411,6 +420,9 @@ class MeasurementPlanCreate(BaseModel):
         dup = sorted({i for i in ids if ids.count(i) > 1})
         if dup:
             raise ValueError(f"测量方案中尺寸重复声明: {dup}")
+        bad_ref = {k: v for k, v in self.gage_rr_studies.items() if v < 1}
+        if bad_ref:
+            raise ValueError(f"量具 R&R 研究 id 必须为正整数: {bad_ref}")
         id_set = set(ids)
         seen_pairs: set[frozenset[str]] = set()
         for c in self.correlations:
@@ -653,6 +665,128 @@ class AssemblyVersionCreate(BaseModel):
 
 
 LockedAssemblySpec.model_rebuild()
+
+
+# -------------------------------------------------------- 量具 R&R 研究
+
+class GageRrMeasurement(BaseModel):
+    """一条 R&R 实测记录：零件 × 操作者 × 重复轮次（同一组合只能出现一次）。"""
+
+    part: str = Field(..., min_length=1, description="零件标识")
+    operator: str = Field(..., min_length=1, description="操作者标识")
+    replicate: int = Field(..., ge=1, description="重复轮次（从 1 起）")
+    value: float = Field(..., description="实测值（有限数）")
+
+    @model_validator(mode="after")
+    def _finite(self) -> "GageRrMeasurement":
+        if not math.isfinite(self.value):
+            raise ValueError(
+                f"零件 {self.part} × 操作者 {self.operator} 第 {self.replicate} 轮"
+                f"实测值必须为有限数，收到 {self.value!r}"
+            )
+        return self
+
+
+class GageRrStudyCreate(BaseModel):
+    """创建量具 R&R 研究：单尺寸的 零件×操作者×重复 完整平衡交叉表。
+
+    至少 2 个零件、2 名操作者、每单元 2 轮重复；每个零件须由所有操作者
+    等次数测量（完整平衡交叉表），缺口在错误信息中逐项指出。
+    """
+
+    name: str = Field(..., min_length=1)
+    note: str = ""
+    dimension_id: str = Field(..., min_length=1,
+                              description="基线链上的尺寸 id")
+    unit: LengthUnit = Field(
+        LengthUnit.MM, description="实测值与过程公差的单位（统一适用）"
+    )
+    process_tolerance: float = Field(
+        ..., gt=0, description="过程公差（公差带宽度，与 unit 同单位）"
+    )
+    measurements: list[GageRrMeasurement] = Field(
+        ..., min_length=1,
+        description="零件×操作者×重复 实测记录（至少 2×2×2，"
+                    "缺口由交叉表校验逐项指出）",
+    )
+    study_variation_multiplier: float = Field(
+        5.15, gt=0,
+        description="%Tolerance 的研究变异倍数 k（AIAG 惯例 5.15，"
+                    "对应正态 99% 散布）",
+    )
+    bootstrap_samples: int = Field(
+        10_000, ge=1_000, le=100_000,
+        description="置信区间 bootstrap 重采样次数（固定种子，零件整簇）",
+    )
+    random_seed: int = Field(
+        20260915, ge=0, description="bootstrap 固定随机种子"
+    )
+
+    @model_validator(mode="after")
+    def _check_cross_table(self) -> "GageRrStudyCreate":
+        if not math.isfinite(self.process_tolerance):
+            raise ValueError("过程公差必须为有限数")
+        if not math.isfinite(self.study_variation_multiplier):
+            raise ValueError("研究变异倍数必须为有限数")
+
+        # 1) 重复单元：同一 零件×操作者×重复轮次 只能出现一次
+        seen: set[tuple[str, str, int]] = set()
+        dups: list[str] = []
+        for m in self.measurements:
+            key = (m.part, m.operator, m.replicate)
+            if key in seen:
+                label = f"{m.part}×{m.operator}×第{m.replicate}轮"
+                if label not in dups:
+                    dups.append(label)
+            seen.add(key)
+        if dups:
+            raise ValueError(
+                f"重复单元（同一零件×操作者×重复轮次提交多次）: {dups}"
+            )
+
+        parts = sorted({m.part for m in self.measurements})
+        operators = sorted({m.operator for m in self.measurements})
+        if len(parts) < 2:
+            raise ValueError(
+                f"零件数不足：量具 R&R 研究至少需要 2 个零件，"
+                f"当前 {len(parts)} 个"
+            )
+        if len(operators) < 2:
+            raise ValueError(
+                f"操作者数不足：量具 R&R 研究至少需要 2 名操作者，"
+                f"当前 {len(operators)} 名"
+            )
+
+        # 2) 交叉表完整性：每个零件须由所有操作者测量
+        counts: dict[tuple[str, str], int] = {}
+        for m in self.measurements:
+            key = (m.part, m.operator)
+            counts[key] = counts.get(key, 0) + 1
+        missing = [f"{p}×{o}" for p in parts for o in operators
+                   if (p, o) not in counts]
+        if missing:
+            raise ValueError(
+                f"交叉表不完整，缺少零件×操作者单元: {missing}"
+                "（每个零件须由所有操作者测量）"
+            )
+
+        # 3) 等次数平衡：各单元重复轮次一致且 ≥ 2
+        nrep = set(counts.values())
+        if len(nrep) != 1:
+            detail = ", ".join(
+                f"{p}×{o}={counts[(p, o)]}次"
+                for p in parts for o in operators
+            )
+            raise ValueError(
+                "各零件×操作者单元重复次数不一致"
+                f"（每个零件须由所有操作者等次数测量）: {detail}"
+            )
+        r = nrep.pop()
+        if r < 2:
+            raise ValueError(
+                f"每个零件×操作者单元至少需要 2 轮重复，当前每单元 {r} 轮"
+            )
+        return self
 
 
 # -------------------------------------------------------- 热分析（温度工况）

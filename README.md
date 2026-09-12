@@ -100,6 +100,8 @@ python3 -m venv --without-pip .venv        # 若 venv 自带 pip 可省略 get-p
 | POST | `/thermal-analyses/{tid}/proposals` | 热整改方案搜索（候选材料/垫片/装配基准温度，按全工况排列） |
 | GET | `/thermal-analyses/{tid}/proposals` | 该热版本下的方案搜索结果列表 |
 | GET | `/thermal-proposals/{pid}` | 读取冻结的热整改方案结果 |
+| POST | `/chains/{id}/gage-rr-studies` | 对链上某一尺寸建立**量具 R&R 研究**（双因素随机效应 ANOVA，创建即冻结） |
+| GET | `/chains/{id}/gage-rr-studies` / `/gage-rr-studies/{sid}` | 研究列表 / 冻结详情 |
 
 ## 典型流程
 
@@ -137,6 +139,10 @@ curl -s -X POST localhost:8000/chains/1/thermal-analyses \
   -H 'Content-Type: application/json' -d @examples/thermal_analysis.json
 curl -s -X POST localhost:8000/thermal-analyses/1/proposals \
   -H 'Content-Type: application/json' -d @examples/thermal_proposal.json
+
+# 8) 量具 R&R 研究（L1 的 零件×操作者×重复 交叉表）
+curl -s -X POST localhost:8000/chains/1/gage-rr-studies \
+  -H 'Content-Type: application/json' -d @examples/gage_rr_study.json
 ```
 
 ### 成本模型
@@ -230,7 +236,8 @@ curl -s -X POST localhost:8000/chains/1/inspection-batches \
   须显式给 `U=0` 与对应 k），`u_cal = U/k`；
 * `bias_correction`：偏倚修正值（带符号），判定前 `x_c = x + b`；
 * `bias_std_uncertainty`：该修正值的标准不确定度 `u_bias`；
-* `repeatability_std`：重复性标准差 `u_rep`；
+* `repeatability_std`：重复性标准差 `u_rep`（可用 `gage_rr_studies`
+  引用冻结量具 R&R 研究，以研究的总量具标准差 σ_GRR 取代手填值）；
 * `correlations`：共用量具带来的测量误差 Pearson 相关，作用于
   `u_rest = √(u_cal²+u_bias²+u_rep²)` 公共误差源（分辨率量化误差相互独立）。
 
@@ -279,6 +286,44 @@ curl -s -X POST localhost:8000/chains/1/inspection-batches \
 （python/fastapi/pydantic/sqlalchemy/numpy）。**批次冻结方案快照**
 （`measurement.plan_snapshot`）：判定报告在创建时一次性算好存库，
 后续读取不变，新版本测量方案不改变历史判定。
+
+## 量具 R&R 研究（双因素随机效应 ANOVA）
+
+对基线链上**某一尺寸**评估测量系统（示例 `examples/gage_rr_study.json`）：
+
+```bash
+curl -s -X POST localhost:8000/chains/1/gage-rr-studies \
+  -H 'Content-Type: application/json' -d @examples/gage_rr_study.json
+```
+
+* **数据要求**：提交 零件×操作者×重复 的**完整平衡交叉表**——至少
+  2 个零件、2 名操作者、每单元 2 轮重复，每个零件须由所有操作者
+  等次数测量；实测值与过程公差共用 `unit`（内部统一换算 mm）。
+  未知尺寸、重复单元（同一 零件×操作者×轮次 提交多次）、交叉表缺口、
+  各单元重复次数不齐均拒绝创建（422）并逐项指出缺口。
+* **方差拆分**（`y = μ + P + O + (PO) + ε`，全随机效应）：
+  `σ²_重复性 = MS_e`，`σ²_交互 = (MS_PO−MS_e)/r`，
+  `σ²_操作者 = (MS_O−MS_PO)/(p·r)`，`σ²_零件 = (MS_P−MS_PO)/(o·r)`；
+  **负方差分量截为零**，原估计保留在 `raw_estimate`
+  （`truncated_to_zero` 标记）。再现性 AV = 操作者 + 交互，
+  总量具 R&R = 重复性 + 再现性，总变差 = GRR + 零件间。
+* **返回指标**：总量具 R&R 及各分量标准差、**方差占比**
+  （100·σ²_c/σ²_总）、**%Study Variation**（100·σ_c/σ_总）、
+  **%Tolerance**（100·k·σ_c/过程公差，k 默认 5.15 可配）、
+  **ndc** = ⌊1.41·σ_零件/σ_GRR⌋，以及主要变差来源与验收提示。
+* **置信区间**：固定种子非参数 bootstrap——对**零件整簇**有放回
+  重采样（保留该零件完整交叉表），重算截零分量与指标，取
+  2.5%/97.5% 分位为 95% CI，并统计各分量成为主要变差来源的频率。
+* **冻结**：研究创建即冻结，多次读取内容不变；历史研究不改写。
+
+### 测量方案引用冻结研究
+
+建测量方案时用 `gage_rr_studies: {"L1": <study_id>}` 引用冻结研究：
+该尺寸的**重复性分量以研究的总量具标准差 σ_GRR 取代手填值**
+（`repeatability_source` 记录研究 id 与被取代的手填值），
+**其余量具参数（校准 U/k、分辨率、偏倚）仍须照常补齐**；
+研究错链 / 不存在 / 尺寸不匹配时拒绝。研究 id 随方案快照冻结，
+派生方案与检验批次均不因后续新研究而改写。
 
 ## 选择性装配（按实测尺寸匹配）
 
@@ -454,7 +499,11 @@ curl -s -X POST localhost:8000/thermal-analyses/1/proposals \
 * 重复边、尺寸 id 重复；相关系数重复声明 / 引用不存在的尺寸；
 * 相关系数越界或相关矩阵非半正定（报告最小特征值）；
 * 测量方案：量具声明缺少校准扩展不确定度或覆盖因子、不确定度分量为负、
-  量具相关矩阵非半正定、未恰好覆盖链上全部尺寸、相关项引用方案外尺寸；
+  量具相关矩阵非半正定、未恰好覆盖链上全部尺寸、相关项引用方案外尺寸、
+  引用的量具 R&R 研究错链 / 不存在 / 与研究尺寸不匹配；
+* 量具 R&R 研究：尺寸不在基线链上（未知尺寸）、重复单元（同一
+  零件×操作者×轮次提交多次）、交叉表缺单元、各单元重复次数不齐、
+  零件 / 操作者 / 重复轮次不足 2、过程公差非正、实测值非有限；
 * 保护带：`mode=fixed` 未给固定长度、`mode=multiple` 误带 fixed、倍数为负；
 * 装配任务：来源批次错链、池名重复、尺寸漏映射 / 重复映射 / 引用链外尺寸、
   装配数量超过最小池容量、跨批限制越界、同批组无共同批次、跨批限制为 1 但
@@ -472,7 +521,7 @@ curl -s -X POST localhost:8000/thermal-analyses/1/proposals \
 .venv/bin/python -m pytest -q
 ```
 
-163 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
+178 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
 WC/RSS 手算值核对、相关系数对 σ_C 的方向性影响、copula 蒙特卡洛、
 种子可复现性、方案分支不覆盖基线、批量调整与成本搜索、检验批次统计、
 测量方案合成不确定度手算核对、方案校验拒收（缺覆盖因子/负分量/
@@ -489,7 +538,13 @@ WC/RSS 手算值核对、相关系数对 σ_C 的方向性影响、copula 蒙特
 固定种子 MC 与解析 σ 一致及四子流可复现、最先越界工况、版本冻结重复
 GET 不变；热整改方案的材料 / 垫片 / 装配基准温度重基准化、材料成本
 去重、锁定材料限制、全工况最差超差率 + 余量 + 成本排序、组合数上限、
-固定种子方案结果冻结可复现；以及三项统计回归——热态制造波动只缩放一次
+固定种子方案结果冻结可复现；量具 R&R 研究的 ANOVA 手算核对
+（SS/MS/方差分量）、负分量截零并保留原估计、交叉表缺口与重复单元
+拒收、%SV/%Tolerance/ndc 与研究变异倍数口径、固定种子 bootstrap
+复现与 %Tolerance–σ_GRR 区间单调一致、零变差退化、研究冻结与列表、
+测量方案引用研究取代重复性分量（研究 id 快照、其余参数仍须补齐、
+错链 / 不存在 / 尺寸不匹配拒收）、历史研究 / 派生方案 / 检验批次
+不改写；以及三项统计回归——热态制造波动只缩放一次
 （scale=2 时组合 σ 等于制造分量而非其两倍）、全边界安全时
 first_spec_breach 为 null 且不出现空 breach_side、分量超差率在热态
 名义间隙叠加单项偏差后判定（基准 reject_reference_gap_mm）。

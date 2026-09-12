@@ -590,7 +590,12 @@ def create_assembly_task(chain_id: int, payload: AssemblyTaskCreate) -> dict:
             seed=payload.random_seed,
             mc_samples=payload.measurement_mc_samples)
     except AssemblyError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=422,
+            detail={"message": str(exc),
+                    **({"diagnostics": exc.diagnostics}
+                       if getattr(exc, "diagnostics", None) else {})}
+        ) from exc
 
     task_id, version_id = db.save_assembly_first_version(
         chain_id, payload.name, payload.note,
@@ -729,7 +734,12 @@ def rearrange_assembly(version_id: int, payload: AssemblyVersionCreate) -> dict:
             nc, batch_rows, parent_req, seed=seed, mc_samples=mc_samples,
             locked_assemblies=locked, parent_version_id=parent.id)
     except AssemblyError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=422,
+            detail={"message": str(exc),
+                    **({"diagnostics": exc.diagnostics}
+                       if getattr(exc, "diagnostics", None) else {})}
+        ) from exc
 
     new_no = max(v.version_no for v in db.list_assembly_versions(parent.task_id)) + 1
     new_id = db.save_assembly_version(

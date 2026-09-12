@@ -78,7 +78,16 @@ ASSEMBLY_FORMULAS = [
 # ------------------------------------------------------------- 实例构建
 
 class AssemblyError(ValueError):
-    """创建期可定位的校验错误（端点转 422）。"""
+    """创建期可定位的校验错误（端点转 422）。
+
+    diagnostics 可选：容量不足等无解原因可附带受限零件池、缺测序号与
+    触发规则，端点把它放进 422 响应的 diagnostics 字段。
+    """
+
+    def __init__(self, message: str, *,
+                 diagnostics: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 def _plan_lookup(plan_combined: dict | None) -> dict[str, dict[str, Any]]:
@@ -185,6 +194,9 @@ def build_pools(nc: NormalizedChain, batch_rows: list[Any],
                         u_res[j] = pd["components_mm"]["u_resolution"]
                         u_rest[j] = pd["u_rest_mm"]
                 xc = np.array([corrected[d] for d in dims], dtype=float)
+                has_any_plan = corr_sub is not None and any(
+                    m["measurement_plan_id"] is not None
+                    for m in measured.values())
                 # 实例内封闭环传播方差（分辨率独立 + ρ 相关的 rest）
                 var = float((signs * u_res) @ (signs * u_res))
                 if corr_sub is not None and u_rest.any():
@@ -203,7 +215,8 @@ def build_pools(nc: NormalizedChain, batch_rows: list[Any],
                     "signs": signs.tolist(),
                     "u_res_mm": u_res.tolist(),
                     "u_rest_mm": u_rest.tolist(),
-                    "has_plan": corr_sub is not None and bool(u_rest.any()),
+                    # 只要引用了测量方案（即使只有分辨率分量）就要传播误差
+                    "has_plan": has_any_plan,
                     "corr": corr_sub.tolist() if corr_sub is not None else None,
                 })
 
@@ -221,7 +234,11 @@ def build_pools(nc: NormalizedChain, batch_rows: list[Any],
 # ------------------------------------------------------------- 规则校验
 
 def _expand_forbidden(payload, pools: list[dict[str, Any]]) -> set[frozenset]:
-    """把禁配关系展开为 ((池位,实例位),(池位,实例位)) 集合。"""
+    """把禁配关系展开为 ((池位, batch_id, serial), ...) 身份集合。
+
+    用实例身份而非池内下标：重排版本移除锁定实例后池会收缩重排，
+    身份坐标保持不变，禁配关系不会错位到其它实例。
+    """
     pool_idx = {p["name"]: q for q, p in enumerate(pools)}
     pairs: set[frozenset] = set()
     raw_seen: set[frozenset] = set()
@@ -245,9 +262,11 @@ def _expand_forbidden(payload, pools: list[dict[str, Any]]) -> set[frozenset]:
 
         def resolve(pool_name, batch_id, serial):
             q = pool_idx[pool_name]
-            hits = [(q, k) for k, ins in enumerate(pools[q]["instances"])
-                    if ins["serial"] == serial
-                    and (batch_id is None or ins["batch_id"] == batch_id)]
+            hits = [
+                (q, ins["batch_id"], ins["serial"])
+                for ins in pools[q]["instances"]
+                if ins["serial"] == serial
+                and (batch_id is None or ins["batch_id"] == batch_id)]
             if not hits:
                 scope = f"批次 {batch_id} " if batch_id is not None else ""
                 raise AssemblyError(
@@ -333,25 +352,20 @@ def validate_rules(payload, pools: list[dict[str, Any]]
                 "关系矛盾：跨批限制为 1（全部同批），但各零件池的"
                 "可用来源批次没有交集")
 
-    # 矛盾 4：禁配双方均为所在池唯一可用实例 => 任何装配都不可能
+    # 矛盾：禁配双方均为所在池唯一可用实例 => 没有任何可行装配
     for edge in forbidden:
-        (a, ai), (b, bj) = sorted(edge)
+        (a, ba, sa), (b, bb, sb) = sorted(edge)
         if (len(pools[a]["instances"]) == 1
-                and len(pools[b]["instances"]) == 1):
+                and len(pools[b]["instances"]) == 1
+                and pools[a]["instances"][0]["batch_id"] == ba
+                and pools[a]["instances"][0]["serial"] == sa
+                and pools[b]["instances"][0]["batch_id"] == bb
+                and pools[b]["instances"][0]["serial"] == sb):
             raise AssemblyError(
                 "关系矛盾：禁配关系 "
-                f"{pools[a]['instances'][ai]['serial']}（池 {pools[a]['name']}）"
-                f" 与 {pools[b]['instances'][bj]['serial']}（池 "
-                f"{pools[b]['name']}）均为各自池内唯一可用实例，"
-                "没有任何可行装配")
-
-    # 矛盾 5：装配数量超过最小池容量
-    min_cap = min(len(p["instances"]) for p in pools)
-    if payload.assembly_count > min_cap:
-        smallest = min(pools, key=lambda p: len(p["instances"]))
-        raise AssemblyError(
-            f"装配数量 {payload.assembly_count} 超过最小零件池 "
-            f"{smallest['name']} 的可用实例数 {len(smallest['instances'])}")
+                f"{sa}（池 {pools[a]['name']}）"
+                f" 与 {sb}（池 {pools[b]['name']}）均为各自池内唯一可用"
+                "实例，没有任何可行装配")
 
     return class_of, forbidden
 
@@ -375,7 +389,8 @@ def enumerate_combos(pools: list[dict[str, Any]], class_of: dict[int, int],
     truncated = False
     fixed_w = guard.get("fixed_mm")
 
-    def rec(p, chosen, chosen_keys, class_batch, distinct, gap_sum, u2_sum):
+    def rec(p, chosen, chosen_idents, chosen_keys, class_batch, distinct,
+            gap_sum, u2_sum):
         nonlocal truncated
         if truncated:
             return
@@ -417,17 +432,19 @@ def enumerate_combos(pools: list[dict[str, Any]], class_of: dict[int, int],
             if ins["key_id"] in chosen_keys:
                 prune["same_workpiece_across_pools"] += 1
                 continue
-            if any(frozenset(((p, i), (q, chosen[q]))) in forbidden
-                   for q in range(p)):
+            ident = (p, ins["batch_id"], ins["serial"])
+            if any(frozenset((ident, ci)) in forbidden
+                   for ci in chosen_idents):
                 prune["forbidden_match"] += 1
                 continue
             nxt_class_batch = dict(class_batch)
             nxt_class_batch[cls] = b
-            rec(p + 1, chosen + [i], chosen_keys | {ins["key_id"]},
+            rec(p + 1, chosen + [i], chosen_idents + [ident],
+                chosen_keys | {ins["key_id"]},
                 nxt_class_batch, new_distinct,
                 gap_sum + ins["gap_part"], u2_sum + ins["u2"])
 
-    rec(0, [], set(), {}, set(), 0.0, 0.0)
+    rec(0, [], [], set(), {}, set(), 0.0, 0.0)
     counts = {"accept": 0, "indeterminate": 0, "reject": 0}
     for c in combos:
         counts[c["decision"]] += 1
@@ -601,10 +618,15 @@ def mc_assembly_gap(instances: list[dict[str, Any]], seed: int,
                 signs = np.asarray(ins["signs"], dtype=float)
                 rng = np.random.default_rng(children[ordinal_by_key[key]])
                 d = len(u_rest)
-                eps = (rng.standard_normal((samples, d))
-                       @ _cholesky_psd(corr).T) * u_rest[None, :]
+                # rest 全部为 0 时退化为零列（纯分辨率方案仍有均匀量化误差）
+                if float(u_rest @ u_rest) > 0.0:
+                    eps = (rng.standard_normal((samples, d))
+                           @ _cholesky_psd(corr).T) * u_rest[None, :]
+                else:
+                    eps = np.zeros((samples, d))
                 half = u_res * math.sqrt(3.0)
-                eps += rng.uniform(-half, half, size=(samples, d))
+                if float(u_res @ u_res) > 0.0:
+                    eps = eps + rng.uniform(-half, half, size=(samples, d))
                 col = eps @ signs
             cache[key] = col
         col = cache[key]
@@ -761,6 +783,58 @@ def _assign_key_ids(pools) -> int:
     return len(key_of)
 
 
+def _capacity_diagnostics(pools0, pools, remaining_need, locked_n
+                          ) -> dict[str, Any]:
+    """容量不足（尚未枚举）时的受限池 / 缺测序号 / 触发规则诊断。"""
+    restricted = []
+    for p in pools:
+        reasons = []
+        if locked_n:
+            reasons.append(
+                f"{locked_n} 个已锁定装配占用了 {len(p['removed_locked'])} 个"
+                "实例")
+        for key in p.get("removed_same_workpiece", []):
+            reasons.append(
+                f"工件 {key} 已被已锁定装配在其它零件池占用，"
+                "同一物理工件不可跨池重复使用")
+        for ex in p["excluded"]:
+            reasons.append(
+                f"{ex['batch_id']}:{ex['serial']} 缺测 "
+                f"{ex['missing_dimension_ids']}（已排除）")
+        restricted.append({
+            "pool": p["name"],
+            "available_instances": len(p["instances"]),
+            "batch_ids": p["batch_ids"],
+            "removed_locked_keys": p["removed_locked"],
+            "removed_same_workpiece_keys":
+                p.get("removed_same_workpiece", []),
+            "reasons": reasons,
+        })
+    missing_serials = [{
+        "pool": p["name"],
+        "batch_id": ex["batch_id"],
+        "serial": ex["serial"],
+        "reason": ex["reason"],
+        "missing_dimension_ids": ex["missing_dimension_ids"],
+    } for p in pools0 for ex in p["excluded"]]
+    smallest = min(restricted, key=lambda x: x["available_instances"])
+    return {
+        "restricted_pools": restricted,
+        "missing_serials": missing_serials,
+        "triggered_rules": [{
+            "rule": "零件池容量不足",
+            "note": (f"要求装配数量 {remaining_need + locked_n}"
+                     + (f"（其中已锁定 {locked_n}，剩余需求 {remaining_need}）"
+                        if locked_n else "")
+                     + f"，最小零件池 {smallest['pool']} 仅余 "
+                     f"{smallest['available_instances']} 个可用实例"),
+        }],
+        "candidate_combo_counts": {
+            "total_feasible": 0, "accept": 0,
+            "indeterminate": 0, "reject": 0},
+    }
+
+
 def _diagnostics(combos, pools, remaining_pools, prune, truncated,
                  required, locked_n, target_mm, guard, k_out) -> dict[str, Any]:
     accept = [c for c in combos if c["decision"] == "accept"]
@@ -907,6 +981,20 @@ def run_task(nc: NormalizedChain, batch_rows: list[Any], payload, *,
     _assign_key_ids(pools0)
     _assign_key_ids(pools)
 
+    sizes = [len(p["instances"]) for p in pools]
+    # 容量不足：422，但附受限池 / 缺测序号 / 触发规则供调用方定位
+    if remaining_need > min(sizes, default=0):
+        smallest = min(pools, key=lambda p: len(p["instances"]))
+        diag = _capacity_diagnostics(
+            pools0, pools, remaining_need, len(locked_indices))
+        raise AssemblyError(
+            f"装配数量 {payload.assembly_count}"
+            + (f"（扣除 {len(locked_indices)} 个已锁定装配后剩余需求 "
+               f"{remaining_need}）" if locked_indices else "")
+            + f"超过最小零件池 {smallest['name']} 的可用容量（实例数 "
+            f"{len(smallest['instances'])}）",
+            diagnostics=diag)
+
     combos, prune, truncated = enumerate_combos(
         pools, class_of, cross_limit, forbidden,
         target_mm["lower"], target_mm["upper"], center,
@@ -917,12 +1005,6 @@ def run_task(nc: NormalizedChain, batch_rows: list[Any], payload, *,
         for p, i in enumerate(c["indices"]):
             mask |= 1 << pools[p]["instances"][i]["key_id"]
         c["key_mask"] = mask
-    sizes = [len(p["instances"]) for p in pools]
-    if remaining_need > min(sizes, default=0):
-        raise AssemblyError(
-            f"扣除 {len(locked_indices)} 个已锁定装配后，剩余需求 "
-            f"{remaining_need} 超过最小零件池容量 "
-            f"{min(sizes, default=0)}")
     pool_key_ids = [[ins["key_id"] for ins in p["instances"]] for p in pools]
     picked, solver_info = solve(
         combos, sizes, remaining_need, pool_key_ids=pool_key_ids)
@@ -1018,13 +1100,11 @@ def run_task(nc: NormalizedChain, batch_rows: list[Any], payload, *,
         "same_batch_classes": {
             pools0[q]["name"]: c for q, c in sorted(class_of.items())},
         "forbidden_match_edges": [
-            {"pool_a": pools0[a]["name"],
-             "instance_a": f'{pools0[a]["instances"][ai]["batch_id"]}:'
-                           f'{pools0[a]["instances"][ai]["serial"]}',
-             "pool_b": pools0[b]["name"],
-             "instance_b": f'{pools0[b]["instances"][bj]["batch_id"]}:'
-                           f'{pools0[b]["instances"][bj]["serial"]}'}
-            for (a, ai), (b, bj) in
+            {"pool_a": pools[a]["name"],
+             "instance_a": f"{ba}:{sa}",
+             "pool_b": pools[b]["name"],
+             "instance_b": f"{bb}:{sb}"}
+            for (a, ba, sa), (b, bb, sb) in
             (sorted(edge) for edge in forbidden)],
         # 原样冻结调用方提交的规则，供后续版本精确重放
         "submitted_same_batch_groups": [

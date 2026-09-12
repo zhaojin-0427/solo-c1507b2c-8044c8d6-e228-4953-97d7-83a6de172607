@@ -576,3 +576,177 @@ def test_task_listing_and_404(client, setup):
     assert client.post(
         "/assembly-versions/9999/rearrange",
         json=_lock_body(v["result"]["assemblies"][0])).status_code == 404
+
+
+# ----------------------------------------------------- 缺陷回归：禁配/分辨率MC/容量诊断
+
+def test_forbidden_survives_lock_and_rearrange(client, setup):
+    """锁定一组含 A1/B1 的合格组合重排后，禁配 A2(P2)+B2(P3) 仍不得入选。"""
+    cid, id_a, id_b = setup
+    forbid = [{
+        "pool_a": "P2", "batch_a": id_a, "serial_a": "A2",
+        "pool_b": "P3", "batch_b": id_b, "serial_b": "B2",
+    }]
+    r = _task(client, setup, name="forbid-keep",
+              forbidden_matches=forbid, assembly_count=3)
+    assert r.status_code == 201, r.text
+    v1 = r.json()
+
+    def has_forbidden(result):
+        for a in result["assemblies"]:
+            mp = {m["pool"]: (m["batch_id"], m["serial"])
+                  for m in a["members"]}
+            if mp["P2"] == (id_a, "A2") and mp["P3"] == (id_b, "B2"):
+                return a["assembly_no"]
+        return None
+
+    assert has_forbidden(v1["result"]) is None
+    # 锁定 v1 的第一个合格装配，在剩余实例上重排
+    lock_asm = next(a for a in v1["result"]["assemblies"]
+                    if a["decision"] == "accept")
+    v2 = client.post(
+        f"/assembly-versions/{v1['version_id']}/rearrange",
+        json=_lock_body(lock_asm)).json()
+    # 版本 2 剩余装配仍不得选中禁配对
+    assert has_forbidden(v2["result"]) is None
+    assert v2["result"]["locked_assemblies"] == 1
+    # 版本 2 里 A2 若被使用，其 P3 搭档不能是 B2（显式逐条复核）
+    for a in v2["result"]["assemblies"]:
+        mp = {m["pool"]: (m["batch_id"], m["serial"])
+              for m in a["members"]}
+        if mp["P2"] == (id_a, "A2"):
+            assert mp["P3"] != (id_b, "B2")
+
+
+RESOLUTION_PLAN = {
+    "name": "resolution-only",
+    "gauges": [
+        {"dimension_id": d, "resolution": 0.02,
+         "calibration_expanded_uncertainty": 0.0, "coverage_factor": 2}
+        for d in ("L1", "L2", "L3")
+    ],
+}
+
+
+def test_resolution_only_plan_propagates_in_monte_carlo(client, setup):
+    """只有 0.02 mm 分辨率分量时，u_res=0.02/(2√3)，MC 必须包含量化误差。"""
+    cid, _, _ = setup
+    pid = client.post(
+        f"/chains/{cid}/measurement-plans",
+        json=RESOLUTION_PLAN).json()["plan_id"]
+    id_a = client.post(f"/chains/{cid}/inspection-batches",
+                       json=_batch("res-A", RAW_A, plan_id=pid)).json()["batch_id"]
+    id_b = client.post(f"/chains/{cid}/inspection-batches",
+                       json=_batch("res-B", RAW_B, plan_id=pid)).json()["batch_id"]
+    r = client.post(f"/chains/{cid}/assembly-tasks", json={
+        "name": "res-mc", "batch_ids": [id_a, id_b],
+        "pools": [{"name": "P1", "dimensions": ["L1"]},
+                  {"name": "P23", "dimensions": ["L2", "L3"]}],
+        "assembly_count": 2, "target_gap": {"lower": 0.05, "upper": 0.6},
+        "random_seed": 42, "measurement_mc_samples": 300000})
+    assert r.status_code == 201, r.text
+    asm = r.json()["result"]["assemblies"][0]
+    # GUM：3 个独立尺寸 sqrt(3)·u_res；P23 实例自身两尺寸 sqrt(2)·u_res
+    u_res = 0.02 / (2 * 3 ** 0.5)
+    assert asm["combined_std_uncertainty_mm"] == pytest.approx(
+        (3 ** 0.5) * u_res, rel=1e-9)
+    mc_std = asm["monte_carlo"]["std_mm"]
+    assert mc_std == pytest.approx(
+        (3 ** 0.5) * u_res, rel=2e-2)
+    # 实例误差明细非空：两尺寸实例 std ≈ 0.02/√6 ≈ 0.008165
+    details = {(d["batch_id"], d["serial"]): d["std_error_mm"]
+               for d in asm["monte_carlo"]["instance_error_std_mm"]}
+    p23 = next(m for m in asm["members"] if m["pool"] == "P23")
+    assert details[(p23["batch_id"], p23["serial"])] == pytest.approx(
+        0.02 / 6 ** 0.5, rel=2e-2)
+    assert len(details) == 2  # 两个工件实例都有量化误差列
+
+
+def test_capacity_shortage_422_includes_diagnostics(client, setup):
+    """缺测使某池只剩 1 实例却请求 2 套时，422 必须附受限池/缺测/规则。"""
+    cid, _, _ = setup
+    only = client.post(f"/chains/{cid}/inspection-batches", json=_batch(
+        "one-p23", [
+            ("Z1", [("L1", None), ("L2", 30.30), ("L3", 80.00)]),
+            ("Z2", [("L1", None), ("L2", 30.29)]),  # P23 缺 L3
+        ]))
+    id_one = only.json()["batch_id"]
+    many = client.post(f"/chains/{cid}/inspection-batches", json=_batch(
+        "many-p1", [
+            ("H1", [("L1", 50.02)]),
+            ("H2", [("L1", 50.03)]),
+        ]))
+    id_many = many.json()["batch_id"]
+    r = client.post(f"/chains/{cid}/assembly-tasks", json={
+        "name": "cap", "batch_ids": [id_one, id_many],
+        "pools": [{"name": "P1", "dimensions": ["L1"]},
+                  {"name": "P23", "dimensions": ["L2", "L3"]}],
+        "assembly_count": 2,
+        "target_gap": {"lower": 0.05, "upper": 0.6}})
+    assert r.status_code == 422
+    body = r.json()["detail"]
+    assert "容量" in body["message"]
+    diag = body["diagnostics"]
+    pools_d = {p["pool"]: p for p in diag["restricted_pools"]}
+    assert pools_d["P23"]["available_instances"] == 1
+    assert pools_d["P1"]["available_instances"] == 2
+    missing = {(m["pool"], m["batch_id"], m["serial"])
+               for m in diag["missing_serials"]}
+    assert ("P23", id_one, "Z2") in missing
+    z2_p23 = next(m for m in diag["missing_serials"]
+                  if m["serial"] == "Z2" and m["batch_id"] == id_one
+                  and m["pool"] == "P23")
+    assert z2_p23["missing_dimension_ids"] == ["L3"]
+    assert diag["triggered_rules"][0]["rule"] == "零件池容量不足"
+
+
+def test_forbidden_survives_pool_index_remap_after_lock(client):
+    """缺陷回归：锁定移除后池收缩重排，禁配关系仍按实例身份生效。
+
+    构造两个专用批次（P1 池 A1..A4、P2 池 B1..B4），锁定 A1+B1 后
+    A2/B2 在剩余池中同为下标 0——若禁配以池内下标存储，会错位到
+    其它实例而错误放行 A2+B2。
+    """
+    cid = client.post("/chains", json={
+        "name": "remap-chain",
+        "closure_lower_limit": -2, "closure_upper_limit": 2,
+        "dimensions": [
+            {"id": "L1", "start": "a", "end": "b", "nominal": 10,
+             "upper_deviation": 1, "lower_deviation": -1, "std_dev": 0.2},
+            {"id": "L2", "start": "b", "end": "a", "nominal": 10,
+             "upper_deviation": 1, "lower_deviation": -1, "std_dev": 0.2,
+             "direction": -1},
+        ],
+        "mc_samples": 2000, "random_seed": 1}).json()["chain_id"]
+
+    def single_batch(name, dim, serials, values):
+        return client.post(f"/chains/{cid}/inspection-batches", json={
+            "name": name, "bootstrap_samples": 1000, "random_seed": 1,
+            "rows": [{"serial": s, "measurements": [
+                {"dimension_id": dim, "value": v, "unit": "mm"}]}
+                for s, v in zip(serials, values)]}).json()["batch_id"]
+
+    bp1 = single_batch("p1-only", "L1",
+                       ["A1", "A2", "A3", "A4"], [10.0, 10.1, 10.2, 10.3])
+    bp2 = single_batch("p2-only", "L2",
+                       ["B1", "B2", "B3", "B4"], [10.0, 10.1, 10.2, 10.3])
+    pools = [{"name": "P1", "dimensions": ["L1"]},
+             {"name": "P2", "dimensions": ["L2"]}]
+    v1 = client.post(f"/chains/{cid}/assembly-tasks", json={
+        "name": "remap", "batch_ids": [bp1, bp2], "pools": pools,
+        "assembly_count": 1, "target_gap": {"lower": -2, "upper": 2},
+        "forbidden_matches": [
+            {"pool_a": "P1", "batch_a": bp1, "serial_a": "A2",
+             "pool_b": "P2", "batch_b": bp2, "serial_b": "B2"}],
+        "measurement_mc_samples": 1000}).json()
+    locked = v1["result"]["assemblies"][0]
+    assert {(m["batch_id"], m["serial"]) for m in locked["members"]} == {
+        (bp1, "A1"), (bp2, "B1")}
+    v2 = client.post(
+        f"/assembly-versions/{v1['version_id']}/rearrange",
+        json=_lock_body(locked)).json()["result"]
+    for a in v2["assemblies"]:
+        if a["locked"]:
+            continue
+        keys = [(m["batch_id"], m["serial"]) for m in a["members"]]
+        assert keys != [(bp1, "A2"), (bp2, "B2")]

@@ -298,8 +298,13 @@ curl -s -X POST localhost:8000/chains/1/assembly-tasks \
 * `forbidden_matches`：两个池中指定 `(batch?, serial)` 实例禁止同装
   （batch 省略则对同名序号的所有来源批次生效）；引用不存在 / 缺测被排除
   的序号、重复声明、禁配双方均为所在池唯一可用实例时拒绝创建。
+  禁配以**实例身份 `(batch_id, serial)`** 存储而非池内下标，因此锁定
+  组合后池收缩重排，禁配关系不会错位到其它实例。
 * 批次必须属于该基线链（错链 422）、批次不存在 404；装配数量超过最小池
-  容量时拒绝。
+  容量时拒绝——此时 422 响应 `detail.diagnostics` 仍给出
+  `restricted_pools`（各池剩余可用实例与缺测/锁定占用原因）、
+  `missing_serials` 与 `triggered_rules`（零件池容量不足），
+  调用方可直接定位无解原因。
 
 ### 间隙、量具不确定度与保护带判定
 
@@ -311,7 +316,9 @@ curl -s -X POST localhost:8000/chains/1/assembly-tasks \
   `u_C² = Σ_实例[Σ_i s_i²u_res,i² + Σ_{i,j∈实例} s_i s_j ρ_ij u_rest,i u_rest,j]`，
   扩展不确定度 `U = k_out·u_C`。每个装配另给**固定种子蒙特卡洛复核**：
   实例内按方案 ρ 相关抽样，实例间用 `SeedSequence` 按 `(批次,序号)`
-  派生独立子流，组合误差为各实例列之和。
+  派生独立子流，组合误差为各实例列之和。**纯分辨率方案也参与 MC**：
+  rest 分量全零时只抽独立均匀量化误差（两尺寸实例 std≈res/√6），
+  不会返回 0 或空的实例误差明细。
 * 保护带（任务级 `guard_band`，默认 `multiple=1.0`）：
   `LSL+w ≤ G ≤ USL−w` 为**合格**，越出 `LSL−w / USL+w` 为**不合格**，
   中间为**不确定**。`target_gap` 给出本任务的目标间隙区间。
@@ -367,7 +374,7 @@ curl -s -X POST localhost:8000/chains/1/assembly-tasks \
 .venv/bin/python -m pytest -q
 ```
 
-118 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
+122 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
 WC/RSS 手算值核对、相关系数对 σ_C 的方向性影响、copula 蒙特卡洛、
 种子可复现性、方案分支不覆盖基线、批量调整与成本搜索、检验批次统计、
 测量方案合成不确定度手算核对、方案校验拒收（缺覆盖因子/负分量/

@@ -19,6 +19,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     select,
 )
@@ -107,6 +108,45 @@ class InspectionBatchRow(Base):
         Integer, nullable=True)
     measurement_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     frozen: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class AssemblyTaskRow(Base):
+    """选择性装配任务（版本线）：首个版本创建时建行。"""
+
+    __tablename__ = "assembly_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(
+        ForeignKey("chains.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class AssemblyVersionRow(Base):
+    """装配任务版本：创建即冻结（含来源批次 / 测量方案 / 种子快照）。"""
+
+    __tablename__ = "assembly_versions"
+    __table_args__ = (
+        UniqueConstraint("task_id", "version_no", name="uq_task_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("assembly_tasks.id", ondelete="CASCADE"), index=True
+    )
+    chain_id: Mapped[int] = mapped_column(
+        ForeignKey("chains.id", ondelete="CASCADE"), index=True
+    )
+    version_no: Mapped[int] = mapped_column(Integer)
+    parent_version_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True)
+    name: Mapped[str] = mapped_column(String(200))
+    note: Mapped[str] = mapped_column(Text, default="")
+    request_json: Mapped[dict] = mapped_column(JSON)
+    result_json: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
@@ -324,3 +364,102 @@ def list_inspection_batches(chain_id: int) -> list[dict]:
             }
             for r in rows
         ]
+
+
+# ------------------------------------------------------- 选择性装配 CRUD
+
+def save_assembly_first_version(chain_id: int, name: str, note: str,
+                                request: dict, result: dict) -> tuple[int, int]:
+    """事务性创建任务行与版本 1，返回 (task_id, version_id)。"""
+    with session_factory() as s:
+        task = AssemblyTaskRow(chain_id=chain_id, name=name, note=note)
+        s.add(task)
+        s.flush()
+        version = AssemblyVersionRow(
+            task_id=task.id, chain_id=chain_id, version_no=1,
+            parent_version_id=None, name=name, note=note,
+            request_json=request, result_json=result,
+        )
+        s.add(version)
+        s.commit()
+        return task.id, version.id
+
+
+def save_assembly_version(task_id: int, chain_id: int, version_no: int,
+                          parent_version_id: int, name: str, note: str,
+                          request: dict, result: dict) -> int:
+    with session_factory() as s:
+        version = AssemblyVersionRow(
+            task_id=task_id, chain_id=chain_id, version_no=version_no,
+            parent_version_id=parent_version_id, name=name, note=note,
+            request_json=request, result_json=result,
+        )
+        s.add(version)
+        s.commit()
+        return version.id
+
+
+def get_assembly_version(version_id: int) -> AssemblyVersionRow | None:
+    with session_factory() as s:
+        row = s.get(AssemblyVersionRow, version_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def get_assembly_task(task_id: int) -> AssemblyTaskRow | None:
+    with session_factory() as s:
+        row = s.get(AssemblyTaskRow, task_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_assembly_versions(task_id: int) -> list[AssemblyVersionRow]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(AssemblyVersionRow)
+            .where(AssemblyVersionRow.task_id == task_id)
+            .order_by(AssemblyVersionRow.version_no)
+        ).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def list_assembly_tasks(chain_id: int) -> list[dict]:
+    with session_factory() as s:
+        tasks = s.scalars(
+            select(AssemblyTaskRow)
+            .where(AssemblyTaskRow.chain_id == chain_id)
+            .order_by(AssemblyTaskRow.id)
+        ).all()
+        out = []
+        for t in tasks:
+            versions = s.scalars(
+                select(AssemblyVersionRow)
+                .where(AssemblyVersionRow.task_id == t.id)
+                .order_by(AssemblyVersionRow.version_no)
+            ).all()
+            out.append({
+                "task_id": t.id,
+                "chain_id": t.chain_id,
+                "name": t.name,
+                "note": t.note,
+                "created_at": t.created_at.isoformat(),
+                "versions": [
+                    {
+                        "version_id": v.id,
+                        "version_no": v.version_no,
+                        "parent_version_id": v.parent_version_id,
+                        "note": v.note,
+                        "status": v.result_json["status"],
+                        "required_count": v.result_json["required_count"],
+                        "qualified_assemblies":
+                            v.result_json["qualified_assemblies"],
+                        "created_at": v.created_at.isoformat(),
+                    }
+                    for v in versions
+                ],
+            })
+        return out

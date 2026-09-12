@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 import numpy as np
 
 from . import database as db
+from .assembly import AssemblyError, run_task
 from .engine import (
     _override_chain,
     closure_samples,
@@ -35,6 +36,8 @@ from .scenarios import (
     rebuild_normalized,
 )
 from .schemas import (
+    AssemblyTaskCreate,
+    AssemblyVersionCreate,
     BatchAdjustRequest,
     ChainCreate,
     CostTargetRequest,
@@ -523,3 +526,263 @@ def get_inspection_batch(batch_id: int) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail=f"检验批次 {batch_id} 不存在")
     return _batch_response(row)
+
+
+# -------------------------------------------------------- 选择性装配任务
+
+def _load_assembly_batches(chain_id: int, batch_ids: list[int]):
+    """取冻结批次并复核同链、不重复（错链 / 不存在 -> 422/404）。"""
+    rows = []
+    problems = []
+    seen: set[int] = set()
+    for bid in batch_ids:
+        if bid in seen:
+            continue
+        seen.add(bid)
+        brow = db.get_inspection_batch(bid)
+        if brow is None:
+            raise HTTPException(
+                status_code=404, detail=f"检验批次 {bid} 不存在")
+        if brow.chain_id != chain_id:
+            problems.append(
+                f"批次 {bid} 属于链 {brow.chain_id}，不属于当前链 {chain_id}")
+        rows.append(brow)
+    if problems:
+        raise HTTPException(status_code=422, detail="；".join(problems))
+    return rows
+
+
+def _assembly_payload(version_row, task_row) -> dict:
+    return {
+        "task_id": version_row.task_id,
+        "task_name": task_row.name,
+        "task_note": task_row.note,
+        "version_id": version_row.id,
+        "version_no": version_row.version_no,
+        "parent_version_id": version_row.parent_version_id,
+        "chain_id": version_row.chain_id,
+        "name": version_row.name,
+        "note": version_row.note,
+        "created_at": version_row.created_at.isoformat(),
+        "frozen": True,
+        "request": version_row.request_json,
+        "result": version_row.result_json,
+    }
+
+
+@app.post("/chains/{chain_id}/assembly-tasks", status_code=201,
+          tags=["assembly"])
+def create_assembly_task(chain_id: int, payload: AssemblyTaskCreate) -> dict:
+    """创建选择性装配任务（版本 1）。
+
+    从同一基线链的多个冻结检验批次取数，按池映射构建零件池；
+    批次错链、尺寸漏映射/重复映射、跨批/同批/禁配关系矛盾时拒绝（422）。
+    系统按偏倚修正后的实测值计算每组封闭环间隙，传播量具不确定度，
+    按保护带判定合格/不确定/不合格，再以「合格数→中心偏差→最差保护余量
+    →跨批次数」字典序选互不相交组合。结果快照冻结源批次、测量方案与种子。
+    """
+    chain_row = _load_chain(chain_id)
+    nc = rebuild_normalized(chain_row.request_json)
+    batch_rows = _load_assembly_batches(chain_id, payload.batch_ids)
+    try:
+        result = run_task(
+            nc, batch_rows, payload,
+            seed=payload.random_seed,
+            mc_samples=payload.measurement_mc_samples)
+    except AssemblyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    task_id, version_id = db.save_assembly_first_version(
+        chain_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), result)
+    saved = db.get_assembly_version(version_id)
+    task = db.get_assembly_task(task_id)
+    return _assembly_payload(saved, task)
+
+
+@app.get("/chains/{chain_id}/assembly-tasks", tags=["assembly"])
+def list_assembly_tasks(chain_id: int) -> dict:
+    _load_chain(chain_id)
+    return {"chain_id": chain_id, "tasks": db.list_assembly_tasks(chain_id)}
+
+
+@app.get("/assembly-tasks/{task_id}/versions", tags=["assembly"])
+def list_task_versions(task_id: int) -> dict:
+    task = db.get_assembly_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"装配任务 {task_id} 不存在")
+    versions = db.list_assembly_versions(task_id)
+    return {
+        "task_id": task_id,
+        "chain_id": task.chain_id,
+        "name": task.name,
+        "versions": [
+            {
+                "version_id": v.id,
+                "version_no": v.version_no,
+                "parent_version_id": v.parent_version_id,
+                "note": v.note,
+                "created_at": v.created_at.isoformat(),
+                "status": v.result_json["status"],
+                "required_count": v.result_json["required_count"],
+                "qualified_assemblies": v.result_json["qualified_assemblies"],
+                "locked_assemblies": v.result_json["locked_assemblies"],
+            }
+            for v in versions
+        ],
+    }
+
+
+@app.get("/assembly-versions/{version_id}", tags=["assembly"])
+def get_assembly_version(version_id: int) -> dict:
+    v = db.get_assembly_version(version_id)
+    if v is None:
+        raise HTTPException(status_code=404,
+                            detail=f"装配版本 {version_id} 不存在")
+    return _assembly_payload(v, db.get_assembly_task(v.task_id))
+
+
+@app.post("/assembly-versions/{version_id}/rearrange", status_code=201,
+          tags=["assembly"])
+def rearrange_assembly(version_id: int, payload: AssemblyVersionCreate) -> dict:
+    """基于已冻结版本另建新版本：锁定调用方确认的组合，重排其余实例。
+
+    新增锁定装配在父版本已锁定集合之上累积；锁定引用必须是父版本求解出的
+    合格组合（池齐全、实例唯一、满足同批/跨批/禁配规则），否则 422。
+    其余实例重新求解；快照独立冻结，父版本不变。
+    """
+    parent = db.get_assembly_version(version_id)
+    if parent is None:
+        raise HTTPException(status_code=404,
+                            detail=f"装配版本 {version_id} 不存在")
+    chain_row = _load_chain(parent.chain_id)
+    nc = rebuild_normalized(chain_row.request_json)
+
+    presult = parent.result_json
+    snap = presult["snapshot"]
+    batch_ids = [b["batch_id"] for b in snap["source_batches"]]
+    batch_rows = _load_assembly_batches(parent.chain_id, batch_ids)
+
+    # 用父版本快照重建等价的任务参数（规则原样重放）
+    parent_req = _ReplayedTask.from_snapshot(snap)
+    # 合并父版本累积锁定 + 本次新增锁定
+    locked = [[{"pool": m["pool"], "batch_id": m["batch_id"],
+                "serial": m["serial"]}
+               for m in a["members"]]
+              for a in presult["assemblies"] if a.get("locked")]
+    pool_names = [p.name for p in parent_req.pools]
+    already = {frozenset((m["pool"], m["batch_id"], m["serial"])
+                         for m in lock) for lock in locked}
+    for spec in payload.locked_assemblies:
+        members = [m for m in spec.members]
+        mpools = [m.pool for m in members]
+        unknown = [p for p in mpools if p not in pool_names]
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail=f"锁定装配引用了不存在的零件池: {sorted(set(unknown))}")
+        if sorted(mpools) != sorted(pool_names):
+            missing = sorted(set(pool_names) - set(mpools))
+            extra = sorted(set(mpools) - set(pool_names))
+            raise HTTPException(
+                status_code=422,
+                detail=f"锁定装配必须恰好覆盖全部零件池；缺失 {missing}，"
+                       f"多余 {extra}")
+        # 必须是父版本求解结果中的合格（accept）组合
+        accepted_keys = {
+            frozenset((m["pool"], m["batch_id"], m["serial"])
+                      for m in a["members"])
+            for a in presult["assemblies"] if a["decision"] == "accept"
+        }
+        key = frozenset((m.pool, m.batch_id, m.serial) for m in members)
+        if key in already:
+            raise HTTPException(
+                status_code=422,
+                detail="锁定装配与已锁定组合重复："
+                       + ", ".join(f"{m.batch_id}:{m.serial}"
+                                   for m in members))
+        if key not in accepted_keys:
+            raise HTTPException(
+                status_code=422,
+                detail="只能锁定父版本求解结果中判定为合格的组合；"
+                       f"给定组合 {sorted(str(k) for k in key)} 不在合格集合中")
+        locked.append([{"pool": m.pool, "batch_id": m.batch_id,
+                        "serial": m.serial} for m in members])
+        already.add(key)
+
+    if len(locked) > parent_req.assembly_count:
+        raise HTTPException(
+            status_code=422,
+            detail=f"锁定装配数 {len(locked)} 超过要求装配数量 "
+                   f"{parent_req.assembly_count}")
+
+    k_out = payload.output_coverage_factor or parent_req.output_coverage_factor
+    gb_spec = payload.guard_band or GuardBandSpec(
+        **snap["guard_band"]["submitted"])
+    mc_samples = payload.measurement_mc_samples or snap["monte_carlo_samples"]
+    seed = payload.random_seed if payload.random_seed is not None else snap["random_seed"]
+    parent_req.output_coverage_factor = k_out
+    parent_req.guard_band = gb_spec
+
+    try:
+        result = run_task(
+            nc, batch_rows, parent_req, seed=seed, mc_samples=mc_samples,
+            locked_assemblies=locked, parent_version_id=parent.id)
+    except AssemblyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    new_no = max(v.version_no for v in db.list_assembly_versions(parent.task_id)) + 1
+    new_id = db.save_assembly_version(
+        parent.task_id, parent.chain_id, new_no, parent.id,
+        parent.name, payload.note,
+        {"note": payload.note,
+         "newly_locked": [
+             [{"pool": m.pool, "batch_id": m.batch_id, "serial": m.serial}
+              for m in s.members] for s in payload.locked_assemblies],
+         "output_coverage_factor": k_out,
+         "guard_band": gb_spec.model_dump(mode="json"),
+         "measurement_mc_samples": mc_samples,
+         "random_seed": seed},
+        result)
+    saved = db.get_assembly_version(new_id)
+    return _assembly_payload(saved, db.get_assembly_task(parent.task_id))
+
+
+class _ReplayedTask:
+    """从版本快照重建 run_task 所需的任务参数（规则原样冻结重放）。"""
+
+    def __init__(self, name, pools, assembly_count, target_gap, cross_batch_limit,
+                 same_batch_groups, forbidden_matches, output_coverage_factor,
+                 guard_band):
+        self.name = name
+        self.pools = pools
+        self.assembly_count = assembly_count
+        self.target_gap = target_gap
+        self.cross_batch_limit = cross_batch_limit
+        self.same_batch_groups = same_batch_groups
+        self.forbidden_matches = forbidden_matches
+        self.output_coverage_factor = output_coverage_factor
+        self.guard_band = guard_band
+
+    @classmethod
+    def from_snapshot(cls, snap: dict) -> "_ReplayedTask":
+        from .schemas import (
+            ForbiddenMatchSpec, PoolSpec, SameBatchGroupSpec, TargetGapSpec,
+        )
+
+        rules = snap.get("rules", {})
+        return cls(
+            name="replayed",
+            pools=[PoolSpec(**p) for p in snap["pool_mapping"]],
+            assembly_count=snap["assembly_count"],
+            target_gap=TargetGapSpec(**snap["target_gap"]["submitted"]),
+            cross_batch_limit=snap["cross_batch_limit"],
+            same_batch_groups=[
+                SameBatchGroupSpec(**g)
+                for g in rules.get("submitted_same_batch_groups", [])],
+            forbidden_matches=[
+                ForbiddenMatchSpec(**f)
+                for f in rules.get("submitted_forbidden_matches", [])],
+            output_coverage_factor=snap["output_coverage_factor"],
+            guard_band=GuardBandSpec(**snap["guard_band"]["submitted"]),
+        )

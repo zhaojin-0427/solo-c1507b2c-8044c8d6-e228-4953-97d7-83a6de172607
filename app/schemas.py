@@ -535,3 +535,121 @@ class InspectionBatchCreate(BaseModel):
     measurement_mc_seed: int = Field(
         20260912, ge=0, description="测量误差蒙特卡洛固定随机种子"
     )
+
+
+# -------------------------------------------------------- 选择性装配任务
+
+class PoolSpec(BaseModel):
+    """零件池：把链上一组尺寸映射到一个池，同池尺寸必须来自同一工件序号。"""
+
+    name: str = Field(..., min_length=1, description="零件池唯一名称")
+    dimensions: list[str] = Field(
+        ..., min_length=1, description="映射到本池的链上尺寸 id（恰好划分链）"
+    )
+
+
+class TargetGapSpec(BaseModel):
+    """目标装配间隙区间（封闭环合格区间，单位可混用，内部换算为 mm）。"""
+
+    lower: float = Field(..., description="目标间隙下限")
+    upper: float = Field(..., description="目标间隙上限")
+    unit: LengthUnit = LengthUnit.MM
+
+    @model_validator(mode="after")
+    def _check(self) -> "TargetGapSpec":
+        if not math.isfinite(self.lower) or not math.isfinite(self.upper):
+            raise ValueError("目标间隙上下限必须为有限数")
+        if self.lower >= self.upper:
+            raise ValueError("目标间隙下限必须严格小于上限")
+        return self
+
+
+class SameBatchGroupSpec(BaseModel):
+    """池间同批关系：列出的零件池在每个装配中必须取自同一来源批次。"""
+
+    pools: list[str] = Field(..., min_length=2)
+
+
+class ForbiddenMatchSpec(BaseModel):
+    """池间禁配：两个池中指定实例禁止出现在同一装配。
+
+    batch 省略时对该工件序号在所有来源批次中的实例生效。
+    """
+
+    pool_a: str = Field(..., min_length=1)
+    batch_a: int | None = Field(None, ge=1)
+    serial_a: str = Field(..., min_length=1)
+    pool_b: str = Field(..., min_length=1)
+    batch_b: int | None = Field(None, ge=1)
+    serial_b: str = Field(..., min_length=1)
+
+
+class AssemblyTaskCreate(BaseModel):
+    """创建选择性装配任务（版本 1）：多批次取数、池映射、规则与求解。"""
+
+    name: str = Field(..., min_length=1)
+    note: str = ""
+    batch_ids: list[int] = Field(
+        ..., min_length=1,
+        description="取数的冻结检验批次 id，必须同属该基线链",
+    )
+    pools: list[PoolSpec] = Field(..., min_length=1)
+    assembly_count: int = Field(..., ge=1, description="要求装配数量")
+    target_gap: TargetGapSpec
+    cross_batch_limit: int | None = Field(
+        None, ge=1,
+        description="每个装配允许的最大不同来源批次数；缺省 = 零件池数（不限）",
+    )
+    same_batch_groups: list[SameBatchGroupSpec] = Field(default_factory=list)
+    forbidden_matches: list[ForbiddenMatchSpec] = Field(default_factory=list)
+    output_coverage_factor: float = Field(
+        2.0, gt=0, description="组合扩展不确定度的覆盖因子 k_out"
+    )
+    guard_band: GuardBandSpec | None = Field(
+        None, description="任务保护带；缺省 mode=multiple, multiple=1.0"
+    )
+    measurement_mc_samples: int = Field(
+        50_000, ge=1_000, le=1_000_000,
+        description="结果组合蒙特卡洛复核样本数（每实例独立误差列）",
+    )
+    random_seed: int = Field(
+        20260913, ge=0, description="蒙特卡洛复核固定随机种子"
+    )
+
+    @model_validator(mode="after")
+    def _basic_checks(self) -> "AssemblyTaskCreate":
+        if len(set(self.batch_ids)) != len(self.batch_ids):
+            dup = sorted({b for b in self.batch_ids
+                          if self.batch_ids.count(b) > 1})
+            raise ValueError(f"来源批次重复列出: {dup}")
+        return self
+
+
+class LockedAssemblySpec(BaseModel):
+    """确认锁定的装配：每池一个 (batch_id, serial) 实例。"""
+
+    members: list["LockedMemberSpec"] = Field(..., min_length=1)
+    note: str = ""
+
+
+class LockedMemberSpec(BaseModel):
+    pool: str = Field(..., min_length=1)
+    batch_id: int = Field(..., ge=1)
+    serial: str = Field(..., min_length=1)
+
+
+class AssemblyVersionCreate(BaseModel):
+    """基于父版本另建版本：锁定确认组合，重排其余实例。"""
+
+    note: str = ""
+    locked_assemblies: list[LockedAssemblySpec] = Field(
+        ..., min_length=1,
+        description="本版本新增确认锁定的装配（在父版本已锁定集合之上）",
+    )
+    output_coverage_factor: float | None = Field(None, gt=0)
+    guard_band: GuardBandSpec | None = None
+    measurement_mc_samples: int | None = Field(None, ge=1_000, le=1_000_000)
+    random_seed: int | None = Field(None, ge=0)
+
+
+LockedAssemblySpec.model_rebuild()

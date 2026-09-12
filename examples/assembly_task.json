@@ -1,0 +1,23 @@
+{
+  "name": "selective-end-play-W38",
+  "note": "从两个冻结检验批次取数：L1 为壳体池，L2+L3 同工件（隔套+轴）为轴系池；要求全部同批、目标端隙 0.05~0.60 mm",
+  "batch_ids": [1, 2],
+  "pools": [
+    {"name": "housing", "dimensions": ["L1"]},
+    {"name": "shaftset", "dimensions": ["L2", "L3"]}
+  ],
+  "assembly_count": 2,
+  "target_gap": {"lower": 0.05, "upper": 0.60, "unit": "mm"},
+  "cross_batch_limit": 1,
+  "same_batch_groups": [
+    {"pools": ["housing", "shaftset"]}
+  ],
+  "forbidden_matches": [
+    {"pool_a": "housing", "batch_a": 1, "serial_a": "W001",
+     "pool_b": "shaftset", "batch_b": 1, "serial_b": "W004"}
+  ],
+  "output_coverage_factor": 2.0,
+  "guard_band": {"mode": "multiple", "multiple": 1.0},
+  "measurement_mc_samples": 50000,
+  "random_seed": 20260913
+}

@@ -667,6 +667,249 @@ class AssemblyVersionCreate(BaseModel):
 LockedAssemblySpec.model_rebuild()
 
 
+# -------------------------------------------------------- 多闭环公差网络
+
+class NetworkLoopPathEntry(BaseModel):
+    """闭环有序路径上的一步：尺寸 id + 沿边通过方向。
+
+    sign=+1 表示沿该尺寸 start -> end 方向通过，-1 表示 end -> start；
+    闭环系数 = sign × 尺寸的测量方向 direction（与单链引擎同一口径）。
+    """
+
+    dimension_id: str = Field(..., min_length=1)
+    sign: Literal[1, -1] = 1
+
+
+class NetworkLoopSpec(BaseModel):
+    """一个闭环（功能要求）：有序路径 + 方向 + 上下限 + 优先级。"""
+
+    id: str = Field(..., min_length=1, description="闭环唯一标识")
+    note: str = ""
+    path: list[NetworkLoopPathEntry] = Field(
+        ..., min_length=1,
+        description="有序路径：按经过顺序列出尺寸与沿边方向，必须首尾衔接并闭合",
+    )
+    lower_limit: float = Field(..., description="闭环功能要求下限")
+    upper_limit: float = Field(..., description="闭环功能要求上限")
+    unit: LengthUnit = LengthUnit.MM
+    priority: int = Field(
+        1, ge=1, description="优先级（正整数，数值越大越关键；允许并列）"
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "NetworkLoopSpec":
+        if not math.isfinite(self.lower_limit) or not math.isfinite(
+                self.upper_limit):
+            raise ValueError(
+                f"闭环 {self.id}: 上下限必须为有限数，收到 "
+                f"[{self.lower_limit!r}, {self.upper_limit!r}]"
+            )
+        if self.lower_limit >= self.upper_limit:
+            raise ValueError(
+                f"闭环 {self.id}: 下限 {self.lower_limit} 必须严格小于上限 "
+                f"{self.upper_limit}"
+            )
+        return self
+
+
+class NetworkDefinition(BaseModel):
+    """共享尺寸池 + 闭环集合 + 相关矩阵的完整图校验。
+
+    校验：尺寸 id 唯一；闭环 id 唯一且 2~20 个；每条路径只引用已知尺寸、
+    同一尺寸不在同一路径中重复、逐段节点衔接（路径断开 / 方向不衔接分别
+    报错）、路径回到起点闭合；相关系数引用存在、不重复、矩阵半正定；
+    正态分布必须给 std_dev（与基线链同一口径）。
+    """
+
+    dimensions: list[DimensionInput] = Field(..., min_length=1)
+    loops: list[NetworkLoopSpec] = Field(..., min_length=2, max_length=20)
+    correlations: list[CorrelationSpec] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_network(self) -> "NetworkDefinition":
+        dims = self.dimensions
+        ids = [d.id for d in dims]
+        if len(set(ids)) != len(ids):
+            dup = sorted({i for i in ids if ids.count(i) > 1})
+            raise ValueError(f"共享尺寸池 id 重复: {dup}")
+        by_id = {d.id: d for d in dims}
+
+        loop_ids = [loop.id for loop in self.loops]
+        if len(set(loop_ids)) != len(loop_ids):
+            dup = sorted({i for i in loop_ids if loop_ids.count(i) > 1})
+            raise ValueError(f"闭环 id 重复: {dup}")
+
+        for loop in self.loops:
+            entries = loop.path
+            path_ids = [e.dimension_id for e in entries]
+            unknown = sorted({i for i in path_ids if i not in by_id})
+            if unknown:
+                raise ValueError(
+                    f"闭环 {loop.id}: 路径引用了未知尺寸: {unknown}"
+                )
+            dup = sorted({i for i in path_ids if path_ids.count(i) > 1})
+            if dup:
+                raise ValueError(
+                    f"闭环 {loop.id}: 同一尺寸在路径中重复出现: {dup}"
+                )
+            # 逐段衔接：上一步的出口节点必须等于本步按声明方向的入口节点
+            start_node = None
+            current = None
+            for k, e in enumerate(entries):
+                d = by_id[e.dimension_id]
+                entry_node = d.start if e.sign == 1 else d.end
+                exit_node = d.end if e.sign == 1 else d.start
+                if k == 0:
+                    start_node = entry_node
+                elif entry_node != current:
+                    if current not in (d.start, d.end):
+                        raise ValueError(
+                            f"闭环 {loop.id}: 路径断开——尺寸 "
+                            f"{e.dimension_id}（节点 {d.start}/{d.end}）与前一"
+                            f"尺寸在节点 {current} 处不相连"
+                        )
+                    raise ValueError(
+                        f"闭环 {loop.id}: 方向不衔接——尺寸 {e.dimension_id} "
+                        f"在节点 {current} 相连，但声明方向 sign={e.sign} 从节点"
+                        f" {entry_node} 出发；通过该尺寸应取 sign={-e.sign}"
+                    )
+                current = exit_node
+            if current != start_node:
+                raise ValueError(
+                    f"闭环 {loop.id}: 路径不闭合——遍历终止于节点 {current}，"
+                    f"未回到起点 {start_node}"
+                )
+
+        seen_pairs: set[frozenset[str]] = set()
+        for c in self.correlations:
+            if c.dim_a not in by_id or c.dim_b not in by_id:
+                raise ValueError(
+                    f"相关系数引用了未知尺寸: {c.dim_a!r}, {c.dim_b!r}"
+                )
+            key = frozenset((c.dim_a, c.dim_b))
+            if key in seen_pairs:
+                raise ValueError(
+                    f"尺寸 {c.dim_a} 与 {c.dim_b} 的相关系数重复声明"
+                )
+            seen_pairs.add(key)
+        ChainCreate._check_psd(ids, self.correlations)
+
+        for d in dims:
+            if d.distribution == DistributionType.NORMAL and d.std_dev is None:
+                raise ValueError(
+                    f"尺寸 {d.id}: normal 分布必须提供 std_dev"
+                )
+        return self
+
+
+class _NetworkDefinitionFields(BaseModel):
+    """网络版本定义字段（创建首版本与派生版本共用）。"""
+
+    source_chain_id: int | None = Field(
+        None, ge=1,
+        description="冻结基线链 id：其组成尺寸整体导入共享尺寸池（只读，不改写基线）",
+    )
+    dimensions: list[DimensionInput] = Field(
+        default_factory=list,
+        description="追加的共享尺寸（与导入尺寸合并，id 不得冲突）",
+    )
+    loops: list[NetworkLoopSpec] = Field(..., min_length=2, max_length=20)
+    correlations: list[CorrelationSpec] = Field(default_factory=list)
+    mc_samples: int = Field(200_000, ge=1_000, le=5_000_000)
+    random_seed: int = Field(20260916, ge=0, description="蒙特卡洛固定随机种子")
+
+    @model_validator(mode="after")
+    def _check_source(self) -> "_NetworkDefinitionFields":
+        if self.source_chain_id is None and not self.dimensions:
+            raise ValueError(
+                "必须提供 source_chain_id（从冻结基线链导入组成尺寸）或 "
+                "dimensions（直接提交共享尺寸池）"
+            )
+        ids = [d.id for d in self.dimensions]
+        if len(set(ids)) != len(ids):
+            dup = sorted({i for i in ids if ids.count(i) > 1})
+            raise ValueError(f"提交的共享尺寸 id 重复: {dup}")
+        return self
+
+
+class NetworkCreate(_NetworkDefinitionFields):
+    """创建多闭环公差网络（版本 1）：同一套装配中共享尺寸的多个功能要求。"""
+
+    name: str = Field(..., min_length=1)
+    note: str = ""
+
+
+class NetworkVersionCreate(_NetworkDefinitionFields):
+    """在网络下另建独立版本：完整新定义随版本冻结，历史版本不回改。"""
+
+    note: str = ""
+    parent_version_id: int | None = Field(
+        None, ge=1,
+        description="父版本 id（缺省为该网络当前最新版本），仅记录血缘",
+    )
+
+
+class NetworkScenarioSearchRequest(BaseModel):
+    """方案分支搜索：锁定尺寸 + 批量调整公差/标准差，按达标/余量/成本排序。
+
+    未锁定尺寸的公差带半宽在 scale_levels 中逐尺寸选择；σ 策略与单链批量
+    调整同口径：均匀/三角未显式给 σ 时随新公差带取理论值，正态默认保留
+    用户 σ（scale_normal_sigma=true 时随公差带等比缩放），std_dev_scale
+    给定则全部未锁定尺寸的 σ 再乘该系数并视为显式 σ。
+    """
+
+    name: str = Field(..., min_length=1)
+    note: str = ""
+    locked_dimensions: list[str] = Field(
+        default_factory=list,
+        description="锁定尺寸：不参与调整，保持版本当前公差带与 σ",
+    )
+    scale_levels: list[float] = Field(
+        default_factory=lambda: [0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+        description="每个未锁定尺寸公差带半宽的可选比例（>1 表示放宽）",
+    )
+    std_dev_scale: float | None = Field(
+        None, gt=0, description="未锁定尺寸标准差的统一乘子（缺省按分布策略）"
+    )
+    scale_normal_sigma: bool = Field(
+        False, description="正态分布的用户 σ 是否随公差带等比缩放"
+    )
+    tightening_cost: dict[str, float] = Field(
+        default_factory=dict,
+        description="尺寸 id -> 每 mm 收紧成本；未列出尺寸取 default_cost",
+    )
+    default_cost: float = Field(1.0, gt=0)
+    target_reject_rate: float = Field(
+        0.0, ge=0, lt=1,
+        description="「全部闭环达标」的联合超差率阈值（蒙特卡洛口径）",
+    )
+    mc_samples: int = Field(
+        50_000, ge=1_000, le=1_000_000,
+        description="候选复核蒙特卡洛样本数（共享抽样，固定种子）",
+    )
+    random_seed: int | None = Field(
+        None, ge=0, description="复核种子；缺省沿用网络版本种子"
+    )
+    max_evaluations: int = Field(4000, ge=1, le=50_000)
+    max_candidates: int = Field(20, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def _check(self) -> "NetworkScenarioSearchRequest":
+        levels = sorted(set(self.scale_levels))
+        if not levels or any(v <= 0 for v in levels):
+            raise ValueError("scale_levels 必须为正数且非空")
+        self.scale_levels = levels
+        locked = self.locked_dimensions
+        if len(set(locked)) != len(locked):
+            dup = sorted({i for i in locked if locked.count(i) > 1})
+            raise ValueError(f"锁定尺寸重复列出: {dup}")
+        bad_cost = {k: v for k, v in self.tightening_cost.items()
+                    if not math.isfinite(v) or v < 0}
+        if bad_cost:
+            raise ValueError(f"单位收紧成本必须为非负有限数: {bad_cost}")
+        return self
+
+
 # -------------------------------------------------------- 量具 R&R 研究
 
 class GageRrMeasurement(BaseModel):

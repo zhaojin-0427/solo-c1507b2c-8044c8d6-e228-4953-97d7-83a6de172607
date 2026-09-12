@@ -8,6 +8,9 @@
 * thermal_analyses   热分析版本（冻结基线之上的热参数 + 工况 + 结果）
 * thermal_proposals  热分析方案搜索结果（候选材料/垫片/基准温度，冻结）
 * gage_rr_studies    量具 R&R 研究（单尺寸 ANOVA 交叉表 + 结果，冻结）
+* networks           多闭环公差网络（版本线；共享尺寸池的多个功能要求）
+* network_versions   网络版本（尺寸池/闭环/相关矩阵快照 + 结果，冻结）
+* network_scenarios  网络方案分支搜索结果（锁定尺寸 + 批量调整，冻结）
 """
 from __future__ import annotations
 
@@ -213,6 +216,66 @@ class GageRrStudyRow(Base):
     bootstrap_samples: Mapped[int] = mapped_column(Integer)
     random_seed: Mapped[int] = mapped_column(Integer)
     frozen: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class NetworkRow(Base):
+    """多闭环公差网络（版本线）：首个版本创建时建行。"""
+
+    __tablename__ = "networks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    # 首版本的来源基线链（只读引用，基线不被改写）；纯尺寸池网络为 None
+    source_chain_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class NetworkVersionRow(Base):
+    """网络版本：尺寸池 / 闭环 / 相关矩阵快照与结果随版本冻结，不回改。"""
+
+    __tablename__ = "network_versions"
+    __table_args__ = (
+        UniqueConstraint("network_id", "version_no", name="uq_network_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    network_id: Mapped[int] = mapped_column(
+        ForeignKey("networks.id", ondelete="CASCADE"), index=True
+    )
+    version_no: Mapped[int] = mapped_column(Integer)
+    parent_version_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True)
+    name: Mapped[str] = mapped_column(String(200))
+    note: Mapped[str] = mapped_column(Text, default="")
+    # 提交的原始请求（含来源链 id 与追加尺寸原样）
+    request_json: Mapped[dict] = mapped_column(JSON)
+    # 归一化快照（尺寸池 mm / 闭环路径系数 / 相关矩阵 / 种子 / 来源）
+    snapshot_json: Mapped[dict] = mapped_column(JSON)
+    result_json: Mapped[dict] = mapped_column(JSON)
+    mc_samples: Mapped[int] = mapped_column(Integer)
+    random_seed: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class NetworkScenarioRow(Base):
+    """网络方案分支搜索结果：锁定尺寸与批量调整候选随请求冻结。"""
+
+    __tablename__ = "network_scenarios"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    network_id: Mapped[int] = mapped_column(
+        ForeignKey("networks.id", ondelete="CASCADE"), index=True
+    )
+    version_id: Mapped[int] = mapped_column(
+        ForeignKey("network_versions.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    request_json: Mapped[dict] = mapped_column(JSON)
+    result_json: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
@@ -669,6 +732,151 @@ def list_gage_rr_studies(chain_id: int) -> list[dict]:
                 "total_gage_std_mm": r.result_json["total_gage_std_mm"],
                 "ndc": r.result_json["ndc"],
                 "dominant_source": r.result_json["dominant_source"]["component"],
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+# ------------------------------------------------------- 多闭环网络 CRUD
+
+def save_network_first_version(name: str, note: str,
+                               source_chain_id: int | None,
+                               request: dict, snapshot: dict, result: dict,
+                               mc_samples: int, seed: int) -> tuple[int, int]:
+    """事务性创建网络行与版本 1，返回 (network_id, version_id)。"""
+    with session_factory() as s:
+        net = NetworkRow(name=name, note=note, source_chain_id=source_chain_id)
+        s.add(net)
+        s.flush()
+        version = NetworkVersionRow(
+            network_id=net.id, version_no=1, parent_version_id=None,
+            name=name, note=note, request_json=request,
+            snapshot_json=snapshot, result_json=result,
+            mc_samples=mc_samples, random_seed=seed,
+        )
+        s.add(version)
+        s.commit()
+        return net.id, version.id
+
+
+def save_network_version(network_id: int, version_no: int,
+                         parent_version_id: int | None, name: str, note: str,
+                         request: dict, snapshot: dict, result: dict,
+                         mc_samples: int, seed: int) -> int:
+    with session_factory() as s:
+        version = NetworkVersionRow(
+            network_id=network_id, version_no=version_no,
+            parent_version_id=parent_version_id, name=name, note=note,
+            request_json=request, snapshot_json=snapshot,
+            result_json=result, mc_samples=mc_samples, random_seed=seed,
+        )
+        s.add(version)
+        s.commit()
+        return version.id
+
+
+def get_network(network_id: int) -> NetworkRow | None:
+    with session_factory() as s:
+        row = s.get(NetworkRow, network_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def get_network_version(version_id: int) -> NetworkVersionRow | None:
+    with session_factory() as s:
+        row = s.get(NetworkVersionRow, version_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_network_versions(network_id: int) -> list[NetworkVersionRow]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(NetworkVersionRow)
+            .where(NetworkVersionRow.network_id == network_id)
+            .order_by(NetworkVersionRow.version_no)
+        ).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def list_networks() -> list[dict]:
+    with session_factory() as s:
+        nets = s.scalars(select(NetworkRow).order_by(NetworkRow.id)).all()
+        out = []
+        for net in nets:
+            versions = s.scalars(
+                select(NetworkVersionRow)
+                .where(NetworkVersionRow.network_id == net.id)
+                .order_by(NetworkVersionRow.version_no)
+            ).all()
+            out.append({
+                "network_id": net.id,
+                "name": net.name,
+                "note": net.note,
+                "source_chain_id": net.source_chain_id,
+                "created_at": net.created_at.isoformat(),
+                "versions": [
+                    {
+                        "version_id": v.id,
+                        "version_no": v.version_no,
+                        "parent_version_id": v.parent_version_id,
+                        "note": v.note,
+                        "loop_ids": [loop["loop_id"]
+                                     for loop in v.snapshot_json["loops"]],
+                        "joint_pass_rate_monte_carlo":
+                            v.result_json["joint"]
+                            ["joint_pass_rate_monte_carlo"],
+                        "all_loops_in_spec_worst_case":
+                            v.result_json["joint"]
+                            ["all_loops_in_spec_worst_case"],
+                        "created_at": v.created_at.isoformat(),
+                    }
+                    for v in versions
+                ],
+            })
+        return out
+
+
+def save_network_scenario(network_id: int, version_id: int, name: str,
+                          note: str, request: dict, result: dict) -> int:
+    with session_factory() as s:
+        row = NetworkScenarioRow(
+            network_id=network_id, version_id=version_id, name=name,
+            note=note, request_json=request, result_json=result,
+        )
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def get_network_scenario(scenario_id: int) -> NetworkScenarioRow | None:
+    with session_factory() as s:
+        row = s.get(NetworkScenarioRow, scenario_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_network_scenarios(version_id: int) -> list[dict]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(NetworkScenarioRow)
+            .where(NetworkScenarioRow.version_id == version_id)
+            .order_by(NetworkScenarioRow.id)
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "network_id": r.network_id,
+                "version_id": r.version_id,
+                "name": r.name,
+                "note": r.note,
+                "candidate_count": len(r.result_json.get("candidates", [])),
                 "created_at": r.created_at.isoformat(),
             }
             for r in rows

@@ -16,9 +16,18 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 
 import numpy as np
+from pydantic import ValidationError
 
 from . import database as db
 from .assembly import AssemblyError, run_task
+from .network import (
+    NetworkError,
+    compute_network,
+    network_from_snapshot,
+    network_snapshot,
+    normalize_network,
+    search_network_scenarios,
+)
 from .engine import (
     _override_chain,
     closure_samples,
@@ -47,6 +56,10 @@ from .schemas import (
     GuardBandSpec,
     InspectionBatchCreate,
     MeasurementPlanCreate,
+    NetworkCreate,
+    NetworkDefinition,
+    NetworkScenarioSearchRequest,
+    NetworkVersionCreate,
     ScenarioCreate,
     ThermalAnalysisCreate,
     ThermalProposalRequest,
@@ -1108,3 +1121,278 @@ def get_thermal_proposal(proposal_id: int) -> dict:
         "submitted_input": row.request_json,
         "result": row.result_json,
     }
+
+
+# -------------------------------------------------------- 多闭环公差网络
+
+def _merge_network_pool(payload) -> tuple[list[dict], dict]:
+    """合并共享尺寸池：冻结基线链导入（只读）+ 调用方追加尺寸。
+
+    返回 (合并后的尺寸提交表示列表, 来源记录)；基线不存在 404，
+    追加尺寸与导入尺寸 id 冲突 422。
+    """
+    imported: list[dict] = []
+    source: dict[str, Any] = {
+        "chain_id": None,
+        "imported_dimension_ids": [],
+        "submitted_dimension_ids": [d.id for d in payload.dimensions],
+    }
+    if payload.source_chain_id is not None:
+        chain_row = db.get_chain(payload.source_chain_id)
+        if chain_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"来源基线链 {payload.source_chain_id} 不存在",
+            )
+        imported = [dict(d) for d in chain_row.request_json["dimensions"]]
+        source["chain_id"] = chain_row.id
+        source["chain_name"] = chain_row.name
+        source["imported_dimension_ids"] = [d["id"] for d in imported]
+
+    imported_ids = {d["id"] for d in imported}
+    submitted_ids = [d.id for d in payload.dimensions]
+    conflict = sorted(imported_ids & set(submitted_ids))
+    if conflict:
+        raise HTTPException(
+            status_code=422,
+            detail=f"追加的共享尺寸与基线链 {payload.source_chain_id} 导入的"
+                   f"尺寸 id 冲突: {conflict}；如需改值请另选 id 或改用纯"
+                   "尺寸池定义",
+        )
+    merged = imported + [d.model_dump(mode="json") for d in payload.dimensions]
+    source["pool_dimension_ids"] = source["imported_dimension_ids"] + submitted_ids
+    return merged, source
+
+
+def _validate_network_definition(dimensions, loops, correlations,
+                                 ) -> NetworkDefinition:
+    """第二阶段 Pydantic 校验（路径断开/方向不衔接/未知重复尺寸/矩阵）。"""
+    try:
+        return NetworkDefinition.model_validate({
+            "dimensions": dimensions,
+            "loops": [loop.model_dump(mode="json") for loop in loops],
+            "correlations": [c.model_dump(mode="json") for c in correlations],
+        })
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=_clean_validation_errors(exc),
+        ) from exc
+
+
+def _clean_validation_errors(exc: ValidationError) -> list[dict]:
+    """把 ValidationError 详情清洗为可 JSON 序列化（ctx 中的异常转字符串）。"""
+    def clean(obj):
+        if isinstance(obj, float) and not math.isfinite(obj):
+            return repr(obj)
+        if isinstance(obj, Exception):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {k: clean(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [clean(v) for v in obj]
+        return obj
+
+    return clean(exc.errors(include_url=False))
+
+
+def _build_network(payload, name: str, note: str):
+    """合并尺寸池 → 校验 → 归一化 → 计算，返回 (net, result, snapshot, request_store)。"""
+    merged, source = _merge_network_pool(payload)
+    definition = _validate_network_definition(
+        merged, payload.loops, payload.correlations)
+    net = normalize_network(
+        definition, payload.mc_samples, payload.random_seed, name=name)
+    result = compute_network(net)
+    snapshot = network_snapshot(net, source)
+    request_store = {
+        **payload.model_dump(mode="json"),
+        "resolved_pool_dimension_ids": source["pool_dimension_ids"],
+    }
+    return net, result, snapshot, request_store, source
+
+
+def _network_version_payload(net_row, version_row) -> dict:
+    return {
+        "network_id": net_row.id,
+        "network_name": net_row.name,
+        "version_id": version_row.id,
+        "version_no": version_row.version_no,
+        "parent_version_id": version_row.parent_version_id,
+        "name": version_row.name,
+        "note": version_row.note,
+        "frozen": True,
+        "baseline_preserved": True,
+        "created_at": version_row.created_at.isoformat(),
+        "source": version_row.snapshot_json["source"],
+        "submitted_input": version_row.request_json,
+        "snapshot": version_row.snapshot_json,
+        "result": version_row.result_json,
+    }
+
+
+@app.post("/networks", status_code=201, tags=["networks"])
+def create_network(payload: NetworkCreate) -> dict:
+    """创建多闭环公差网络（版本 1）：同一套装配共享尺寸的多个功能要求。
+
+    可从冻结基线链导入组成尺寸（source_chain_id，基线只读不改写），也可
+    直接提交共享尺寸池（或两者合并，id 不得冲突）；为 2~20 个闭环设置
+    有序路径、沿边方向、上下限与优先级。路径断开、方向不衔接、未知或
+    重复尺寸、相关矩阵非半正定均拒绝（422）。蒙特卡洛对共享尺寸每轮只
+    抽样一次，返回各闭环极值边界 / RSS 区间 / 超差率，以及闭环间协方差、
+    联合合格率、同时失效组合与尺寸×闭环敏感度矩阵。版本快照冻结入库。
+    """
+    net, result, snapshot, request_store, _ = _build_network(
+        payload, payload.name, payload.note)
+    network_id, version_id = db.save_network_first_version(
+        payload.name, payload.note, payload.source_chain_id,
+        request_store, snapshot, result,
+        payload.mc_samples, payload.random_seed)
+    net_row = db.get_network(network_id)
+    version_row = db.get_network_version(version_id)
+    return _network_version_payload(net_row, version_row)
+
+
+@app.get("/networks", tags=["networks"])
+def list_networks() -> dict:
+    return {"networks": db.list_networks()}
+
+
+def _load_network(network_id: int):
+    row = db.get_network(network_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"网络 {network_id} 不存在")
+    return row
+
+
+@app.get("/networks/{network_id}", tags=["networks"])
+def get_network(network_id: int) -> dict:
+    row = _load_network(network_id)
+    versions = db.list_network_versions(network_id)
+    return {
+        "network_id": row.id,
+        "name": row.name,
+        "note": row.note,
+        "source_chain_id": row.source_chain_id,
+        "created_at": row.created_at.isoformat(),
+        "versions": [
+            {
+                "version_id": v.id,
+                "version_no": v.version_no,
+                "parent_version_id": v.parent_version_id,
+                "note": v.note,
+                "mc_samples": v.mc_samples,
+                "random_seed": v.random_seed,
+                "loop_ids": [loop["loop_id"]
+                             for loop in v.snapshot_json["loops"]],
+                "joint_pass_rate_monte_carlo":
+                    v.result_json["joint"]["joint_pass_rate_monte_carlo"],
+                "all_loops_in_spec_worst_case":
+                    v.result_json["joint"]["all_loops_in_spec_worst_case"],
+                "created_at": v.created_at.isoformat(),
+            }
+            for v in versions
+        ],
+    }
+
+
+@app.post("/networks/{network_id}/versions", status_code=201, tags=["networks"])
+def create_network_version(network_id: int,
+                           payload: NetworkVersionCreate) -> dict:
+    """在网络下另建独立版本（完整新定义随版本冻结，历史版本不回改）。
+
+    parent_version_id 缺省取当前最新版本（仅记录血缘）；来源基线链只读。
+    """
+    net_row = _load_network(network_id)
+    versions = db.list_network_versions(network_id)
+    if payload.parent_version_id is not None:
+        parent_ids = {v.id for v in versions}
+        if payload.parent_version_id not in parent_ids:
+            raise HTTPException(
+                status_code=404,
+                detail=f"网络 {network_id} 下父版本 "
+                       f"{payload.parent_version_id} 不存在",
+            )
+        parent_id = payload.parent_version_id
+    else:
+        parent_id = versions[-1].id if versions else None
+
+    net, result, snapshot, request_store, _ = _build_network(
+        payload, net_row.name, payload.note)
+    new_no = max((v.version_no for v in versions), default=0) + 1
+    version_id = db.save_network_version(
+        network_id, new_no, parent_id, net_row.name, payload.note,
+        request_store, snapshot, result,
+        payload.mc_samples, payload.random_seed)
+    return _network_version_payload(net_row, db.get_network_version(version_id))
+
+
+def _load_network_version(version_id: int):
+    row = db.get_network_version(version_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"网络版本 {version_id} 不存在")
+    return row
+
+
+@app.get("/network-versions/{version_id}", tags=["networks"])
+def get_network_version(version_id: int) -> dict:
+    """读取冻结网络版本：快照与结果创建时固化，重复读取内容不变。"""
+    version_row = _load_network_version(version_id)
+    net_row = db.get_network(version_row.network_id)
+    return _network_version_payload(net_row, version_row)
+
+
+@app.post("/network-versions/{version_id}/scenarios", status_code=201,
+          tags=["networks"])
+def create_network_scenario(version_id: int,
+                            payload: NetworkScenarioSearchRequest) -> dict:
+    """方案分支搜索：锁定尺寸并批量调整公差/标准差，结果排序后冻结。
+
+    未锁定尺寸在 scale_levels 网格上逐尺寸选择公差带比例（σ 策略与单链
+    批量调整同口径）；beam search 以联合超差率代理剪枝，候选用共享抽样
+    固定种子蒙特卡洛复核，按「全部闭环达标 → 最高优先级余量（大者优先）
+    → 收紧成本（升序）」排列。版本快照与来源基线不改写。
+    """
+    version_row = _load_network_version(version_id)
+    net = network_from_snapshot(version_row.snapshot_json)
+    try:
+        result = search_network_scenarios(net, payload)
+    except NetworkError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    scenario_id = db.save_network_scenario(
+        version_row.network_id, version_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), result)
+    saved = db.get_network_scenario(scenario_id)
+    return _network_scenario_payload(saved)
+
+
+@app.get("/network-versions/{version_id}/scenarios", tags=["networks"])
+def list_network_scenarios(version_id: int) -> dict:
+    _load_network_version(version_id)
+    return {"version_id": version_id,
+            "scenarios": db.list_network_scenarios(version_id)}
+
+
+def _network_scenario_payload(row) -> dict:
+    return {
+        "scenario_id": row.id,
+        "network_id": row.network_id,
+        "version_id": row.version_id,
+        "name": row.name,
+        "note": row.note,
+        "frozen": True,
+        "created_at": row.created_at.isoformat(),
+        "submitted_input": row.request_json,
+        "result": row.result_json,
+    }
+
+
+@app.get("/network-scenarios/{scenario_id}", tags=["networks"])
+def get_network_scenario(scenario_id: int) -> dict:
+    """读取冻结的网络方案分支搜索结果。"""
+    row = db.get_network_scenario(scenario_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"网络方案 {scenario_id} 不存在")
+    return _network_scenario_payload(row)

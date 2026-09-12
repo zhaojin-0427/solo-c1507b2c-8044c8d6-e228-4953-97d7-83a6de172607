@@ -209,7 +209,8 @@ curl -s -X POST localhost:8000/chains/1/inspection-batches \
 
 * `resolution`：分辨率 → `u_res = resolution/(2√3)`（半宽均匀分布）；
 * `calibration_expanded_uncertainty` + `coverage_factor`：校准证书
-  扩展不确定度 U 与覆盖因子 k，**必须成对给出**，`u_cal = U/k`；
+  扩展不确定度 U 与覆盖因子 k，**每个量具声明的必填项**（无校准数据时
+  须显式给 `U=0` 与对应 k），`u_cal = U/k`；
 * `bias_correction`：偏倚修正值（带符号），判定前 `x_c = x + b`；
 * `bias_std_uncertainty`：该修正值的标准不确定度 `u_bias`；
 * `repeatability_std`：重复性标准差 `u_rep`；
@@ -217,21 +218,29 @@ curl -s -X POST localhost:8000/chains/1/inspection-batches \
   `u_rest = √(u_cal²+u_bias²+u_rep²)` 公共误差源（分辨率量化误差相互独立）。
 
 合成标准不确定度 `u_c = √(u_res²+u_cal²+u_bias²+u_rep²)`。
-**拒绝保存（422）**：覆盖因子缺失或与 U 不成对、任一分量为负、
+**拒绝保存（422）**：量具声明缺少校准扩展不确定度或覆盖因子（含只给
+`dimension_id` 的情形，拒绝后整个方案不落库）、任一分量为负、
 相关矩阵非半正定、未恰好覆盖链上全部尺寸、相关项引用方案外尺寸。
 方案创建后不可修改；需要调整时另建新版本方案，历史批次引用不受影响。
 
 ### 批次判定（`measurement` 报告）
 
 批次引用 `measurement_plan_id` 后，系统**先修正偏倚**（`x_c = x + b`），
-再用两套口径评定各实测值与封闭环的扩展不确定度 `U = k_out·u_c`
-（`output_coverage_factor`，默认 2）：
+再用两套口径评定各实测值与封闭环的不确定度：
 
 * **GUM 线性传播**：封闭环
   `u_C² = Σ s_i²u_res,i² + ΣΣ s_i s_j ρ_ij u_rest,i u_rest,j`；
 * **固定种子蒙特卡洛**：`ε_rest ~ N(0, DρD)`（Cholesky），
   `ε_res,i ~ U(−res_i/2, res_i/2)` 独立，`X_true = x_c + ε`；
   所有工件共用同一组误差样本，同一种子下整批判定可精确复现。
+
+**扩展不确定度的覆盖因子口径**：逐尺寸 `U_i = k_i·u_c,i`，k_i 取方案中
+该量具声明的 `coverage_factor`；封闭环跨多台量具，取批次
+`output_coverage_factor`（默认 2.0）。GUM 与蒙特卡洛同一口径：
+响应中每个实测项带 `expanded_uncertainty_mm: {gum, monte_carlo}`
+（`k_i·u_c,i` 与 `k_i·std(ε_i)`），尺寸级另有 `monte_carlo` 块，
+封闭环 `closure.monte_carlo.expanded_uncertainty_mm = k_out·std(ε_C)`，
+与 `closure.gum.expanded_uncertainty_mm = k_out·u_C` 并列。
 
 **保护带** `guard_band`：`{"mode":"multiple","multiple":h}` 时 `w = h·U`；
 `{"mode":"fixed","fixed":…,"unit":…}` 时为固定长度。判定规则：
@@ -260,7 +269,7 @@ curl -s -X POST localhost:8000/chains/1/inspection-batches \
 * 方向不闭合（报告各节点 出度−入度 不平衡量）；多环不连通；
 * 重复边、尺寸 id 重复；相关系数重复声明 / 引用不存在的尺寸；
 * 相关系数越界或相关矩阵非半正定（报告最小特征值）；
-* 测量方案：覆盖因子缺失或与校准扩展不确定度不成对、不确定度分量为负、
+* 测量方案：量具声明缺少校准扩展不确定度或覆盖因子、不确定度分量为负、
   量具相关矩阵非半正定、未恰好覆盖链上全部尺寸、相关项引用方案外尺寸；
 * 保护带：`mode=fixed` 未给固定长度、`mode=multiple` 误带 fixed、倍数为负。
 
@@ -270,9 +279,10 @@ curl -s -X POST localhost:8000/chains/1/inspection-batches \
 .venv/bin/python -m pytest -q
 ```
 
-81 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
+83 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
 WC/RSS 手算值核对、相关系数对 σ_C 的方向性影响、copula 蒙特卡洛、
 种子可复现性、方案分支不覆盖基线、批量调整与成本搜索、检验批次统计、
-测量方案合成不确定度手算核对、方案校验拒收（覆盖因子缺失/负分量/
-非半正定）、偏倚修正与保护带判定、GUM 与蒙特卡洛概率对照、
+测量方案合成不确定度手算核对、方案校验拒收（缺覆盖因子/负分量/
+非半正定/未覆盖全链）、偏倚修正与保护带判定、GUM 与蒙特卡洛概率对照、
+逐尺寸与封闭环扩展不确定度的覆盖因子口径（方案 k_i / 批次 k_out）、
 封闭环相关传播、方案快照冻结与新版本隔离。

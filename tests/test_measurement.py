@@ -116,8 +116,10 @@ def test_plan_unit_conversion(client, simple_chain_payload):
          "calibration_expanded_uncertainty": 4.0, "coverage_factor": 2.0,
          "bias_correction": 2.0, "bias_std_uncertainty": 1.0,
          "repeatability_std": 3.0},
-        {"dimension_id": "L2", "resolution": 0.005},
-        {"dimension_id": "L3", "repeatability_std": 0.004},
+        {"dimension_id": "L2", "resolution": 0.005,
+         "calibration_expanded_uncertainty": 0.003, "coverage_factor": 2.0},
+        {"dimension_id": "L3", "repeatability_std": 0.004,
+         "calibration_expanded_uncertainty": 0.006, "coverage_factor": 2.0},
     ]}
     j = _make_plan(client, cid, plan)
     dims = {d["dimension_id"]: d for d in j["plan"]["dimensions"]}
@@ -126,10 +128,14 @@ def test_plan_unit_conversion(client, simple_chain_payload):
         0.01 / (2 * SQRT3))
     assert l1["components_mm"]["u_calibration"] == pytest.approx(0.002)
     assert l1["bias_correction_mm"] == pytest.approx(0.002)
-    # 只给分辨率的 L2：u_c = u_res
+    # L2：分辨率 + 校准两分量
     assert dims["L2"]["combined_std_uncertainty_mm"] == pytest.approx(
-        0.005 / (2 * SQRT3))
-    assert dims["L3"]["combined_std_uncertainty_mm"] == pytest.approx(0.004)
+        math.sqrt((0.005 / (2 * SQRT3)) ** 2 + 0.0015 ** 2))
+    # L3：校准 + 重复性
+    assert dims["L3"]["combined_std_uncertainty_mm"] == pytest.approx(
+        math.sqrt(0.003 ** 2 + 0.004 ** 2))
+    # 覆盖因子随方案保存（判定时的逐尺寸扩展因子）
+    assert dims["L1"]["coverage_factor"] == 2.0
 
 
 def test_plan_reject_missing_coverage_factor(client, simple_chain_payload):
@@ -147,6 +153,27 @@ def test_plan_reject_missing_coverage_factor(client, simple_chain_payload):
     r = client.post(f"/chains/{cid}/measurement-plans",
                     json={"name": "bad", "gauges": bad2})
     assert r.status_code == 422 and "校准扩展不确定度缺失" in r.text
+
+
+def test_plan_reject_gauge_with_only_dimension_id(client,
+                                                  simple_chain_payload):
+    """只有 dimension_id 的量具声明（缺覆盖因子）拒绝保存，且不落库。"""
+    cid = _make_chain(client, simple_chain_payload)
+    r = client.post(f"/chains/{cid}/measurement-plans", json={
+        "name": "empty-gauges",
+        "gauges": [{"dimension_id": "L1"},
+                   {"dimension_id": "L2"},
+                   {"dimension_id": "L3"}]})
+    assert r.status_code == 422
+    assert "覆盖因子缺失" in r.text
+    # 混合情形：完整量具 + 一个缺覆盖因子 => 整体拒绝，一个方案都不落库
+    gauges = [dict(g) for g in PLAN["gauges"]]
+    gauges[1] = {"dimension_id": "L2", "resolution": 0.005}
+    r = client.post(f"/chains/{cid}/measurement-plans",
+                    json={"name": "partial", "gauges": gauges})
+    assert r.status_code == 422 and "覆盖因子缺失" in r.text
+    plans = client.get(f"/chains/{cid}/measurement-plans").json()["plans"]
+    assert plans == []
 
 
 def test_plan_reject_negative_components(client, simple_chain_payload):
@@ -198,9 +225,10 @@ def test_plan_reject_coverage_problems(client, simple_chain_payload):
                     json={"name": "bad", "gauges": PLAN["gauges"][:2]})
     assert r.status_code == 422 and "缺少链上尺寸" in r.text
     assert "L3" in r.text
-    # 链外尺寸
+    # 链外尺寸（量具声明本身完整，才能走到链覆盖校验）
     gauges = [dict(g) for g in PLAN["gauges"]] + [
-        {"dimension_id": "X9", "resolution": 0.01}]
+        {"dimension_id": "X9", "resolution": 0.01,
+         "calibration_expanded_uncertainty": 0.004, "coverage_factor": 2.0}]
     r = client.post(f"/chains/{cid}/measurement-plans",
                     json={"name": "bad", "gauges": gauges})
     assert r.status_code == 422 and "链之外" in r.text
@@ -339,6 +367,11 @@ def test_batch_closure_gum_and_mc(client, simple_chain_payload):
     # 蒙特卡洛封闭环标准差收敛到 GUM 解析值
     assert cl["monte_carlo"]["std_mm"] == pytest.approx(U_CLOSURE, rel=0.03)
     assert cl["monte_carlo"]["seed"] == 5
+    # 封闭环蒙特卡洛扩展不确定度 = k_out · std(ε_C)
+    assert cl["monte_carlo"]["expanded_uncertainty_mm"] == pytest.approx(
+        2 * cl["monte_carlo"]["std_mm"])
+    assert cl["monte_carlo"]["expanded_uncertainty_mm"] == pytest.approx(
+        cl["gum"]["expanded_uncertainty_mm"], rel=0.03)
     # 保护带与判定（w = 2·u_C；偏倚合计 +0.003）
     w_c = 2 * U_CLOSURE
     assert cl["guard_band_mm"] == pytest.approx(w_c)
@@ -532,6 +565,59 @@ def test_batch_response_traceability(client, simple_chain_payload):
     assert m["policy"]["output_coverage_factor"] == 2.0
     assert m["policy"]["guard_band"]["mode"] == "multiple"
     assert m["policy"]["guard_band"]["multiple"] == 1.0
+    # 逐尺寸与逐工件的扩展不确定度（GUM 与蒙特卡洛并列，同一 k_i）
+    assert l1["coverage_factor"] == 2.0
+    assert l1["expanded_uncertainty_mm"] == pytest.approx(2 * U_C[0])
+    assert l1["monte_carlo"]["std_mm"] == pytest.approx(U_C[0], rel=0.03)
+    assert l1["monte_carlo"]["expanded_uncertainty_mm"] == pytest.approx(
+        2 * l1["monte_carlo"]["std_mm"])
+    item = l1["items"][0]
+    assert item["expanded_uncertainty_mm"]["gum"] == pytest.approx(2 * U_C[0])
+    assert item["expanded_uncertainty_mm"]["monte_carlo"] == pytest.approx(
+        l1["monte_carlo"]["expanded_uncertainty_mm"])
+    # 封闭环蒙特卡洛扩展不确定度（k_out 口径）
+    cl_mc = m["closure"]["monte_carlo"]
+    assert cl_mc["expanded_uncertainty_mm"] == pytest.approx(
+        2 * cl_mc["std_mm"])
+
+
+def test_batch_expanded_uncertainty_follows_plan_k(client,
+                                                   simple_chain_payload):
+    """逐尺寸扩展不确定度与方案中的覆盖因子一致；封闭环用批次 k_out。"""
+    cid = _make_chain(client, simple_chain_payload)
+    # L1 量具证书 k=3（U 同步调整使 u_cal 不变），其余 k=2
+    plan = {"name": "mixed-k", "gauges": [
+        dict(PLAN["gauges"][0], coverage_factor=3.0,
+             calibration_expanded_uncertainty=0.006),
+        PLAN["gauges"][1], PLAN["gauges"][2]],
+        "correlations": PLAN["correlations"]}
+    _make_plan(client, cid, plan)
+    rows = _rows({"A": {"L1": 50.04, "L2": 30.30, "L3": 80.00}})
+    # 批次 output_coverage_factor=2.5：只影响封闭环
+    j = _gauged_batch(client, cid, rows, output_coverage_factor=2.5)
+    m = j["measurement"]
+    dims = {d["dimension_id"]: d for d in m["dimensions"]}
+    l1, l2 = dims["L1"], dims["L2"]
+    # 逐尺寸：k 来自方案（L1=3，L2=2），u_c 与 k 无关
+    assert l1["combined_std_uncertainty_mm"] == pytest.approx(U_C[0])
+    assert l1["coverage_factor"] == 3.0
+    assert l1["expanded_uncertainty_mm"] == pytest.approx(3 * U_C[0])
+    assert l1["monte_carlo"]["expanded_uncertainty_mm"] == pytest.approx(
+        3 * l1["monte_carlo"]["std_mm"])
+    item = l1["items"][0]
+    assert item["expanded_uncertainty_mm"]["gum"] == pytest.approx(3 * U_C[0])
+    assert item["expanded_uncertainty_mm"]["monte_carlo"] == pytest.approx(
+        l1["monte_carlo"]["expanded_uncertainty_mm"])
+    assert l2["expanded_uncertainty_mm"] == pytest.approx(2 * U_C[1])
+    # 保护带跟随逐尺寸 U：w_L1 = 1 × 3·u_c
+    assert l1["guard_band_mm"] == pytest.approx(3 * U_C[0])
+    # 封闭环：k_out=2.5，GUM 与蒙特卡洛同口径
+    cl = m["closure"]
+    assert cl["gum"]["expanded_uncertainty_mm"] == pytest.approx(
+        2.5 * U_CLOSURE)
+    assert cl["monte_carlo"]["expanded_uncertainty_mm"] == pytest.approx(
+        2.5 * cl["monte_carlo"]["std_mm"])
+    assert cl["guard_band_mm"] == pytest.approx(2.5 * U_CLOSURE)
 
 
 def test_closure_without_spec_no_decision(client):
@@ -549,8 +635,10 @@ def test_closure_without_spec_no_decision(client):
     }
     cid = _make_chain(client, payload)
     plan = {"name": "p", "gauges": [
-        {"dimension_id": "A", "repeatability_std": 0.002},
-        {"dimension_id": "B", "repeatability_std": 0.003},
+        {"dimension_id": "A", "calibration_expanded_uncertainty": 0.0,
+         "coverage_factor": 2.0, "repeatability_std": 0.002},
+        {"dimension_id": "B", "calibration_expanded_uncertainty": 0.0,
+         "coverage_factor": 2.0, "repeatability_std": 0.003},
     ]}
     _make_plan(client, cid, plan)
     rows = [{"serial": "W1", "measurements": [

@@ -23,7 +23,9 @@ u_rest = √(u_cal² + u_bias² + u_rep²) 部分（公共误差源：同一台�
     ε_rest ~ N(0, DρD)（D = diag(u_rest)，Cholesky 分解）
     ε_res,i ~ U(−resolution_i/2, +resolution_i/2)，逐尺寸独立
     X_true = x_c + ε_rest + ε_res
-逐尺寸与封闭环的扩展不确定度 U = k_out · u_c（k_out 为批次输出覆盖因子）。
+扩展不确定度：逐尺寸 U_i = k_i·u_c,i（k_i 为方案中该量具的覆盖因子）；
+封闭环 U_C = k_out·u_C（k_out 为批次输出覆盖因子，默认 2.0）。
+GUM 与蒙特卡洛使用同一覆盖因子口径（U_MC = k·std(ε)）。
 
 判定（双边保护带，带宽 w）
 =========================
@@ -59,12 +61,13 @@ PLAN_FORMULAS = [
     "u_rest = √(u_cal²+u_bias²+u_rep²)；分辨率分量相互独立",
     "封闭环 GUM 线性传播：u_C² = Σ_i s_i²u_res,i² "
     "+ Σ_iΣ_j s_i s_j ρ_ij u_rest,i u_rest,j",
-    "输出扩展不确定度 U = k_out·u_c（k_out 为批次指定的输出覆盖因子）",
+    "逐尺寸扩展不确定度 U_i = k_i·u_c,i（k_i 为方案中该量具的覆盖因子）；"
+    "封闭环 U_C = k_out·u_C（k_out 为批次输出覆盖因子，默认 2.0）",
 ]
 
 DECISION_FORMULAS = [
-    "保护带 w：mode=multiple 时 w = h·U（h 为扩展不确定度倍数）；"
-    "mode=fixed 时 w 为固定长度",
+    "保护带 w：mode=multiple 时 w = h·U（h 为扩展不确定度倍数，U 取对应层级："
+    "尺寸用 k_i·u_c,i，封闭环用 k_out·u_C）；mode=fixed 时 w 为固定长度",
     "判定：LSL+w ≤ x_c ≤ USL−w → 接收；x_c < LSL−w 或 x_c > USL+w → 拒收；"
     "其余 → 不确定",
     "接收时真值越界概率 p_out = P(X_true∉[LSL,USL])；"
@@ -74,6 +77,8 @@ DECISION_FORMULAS = [
     "蒙特卡洛：ε_rest ~ N(0, DρD)（D=diag(u_rest)，Cholesky），"
     "ε_res,i ~ U(−res_i/2, res_i/2) 独立，X_true = x_c + ε_rest + ε_res；"
     "p 为固定种子样本的经验比例",
+    "蒙特卡洛扩展不确定度与 GUM 同一覆盖因子口径："
+    "逐尺寸 U_MC,i = k_i·std(ε_i)，封闭环 U_MC,C = k_out·std(ε_C)",
     "所有工件共用同一组误差样本：判定之间相互一致，"
     "同一种子下整批结果可精确复现",
 ]
@@ -168,6 +173,7 @@ def normalize_plan(nc: NormalizedChain, payload) -> dict[str, Any]:
             },
             "resolution_mm": res_mm,
             "bias_correction_mm": bias_mm,
+            "coverage_factor": float(g.coverage_factor),
             "components_mm": {
                 "u_resolution": u_res,
                 "u_calibration": u_cal,
@@ -268,11 +274,22 @@ def evaluate_batch(nc: NormalizedChain, plan: dict[str, Any],
     corr = np.array(plan["correlation"]["matrix"], dtype=float)
     signs = np.array([d.sign for d in dims], dtype=float)
 
+    # ---- 逐尺寸扩展因子：取方案中该量具的覆盖因子 k_i
+    #      （历史快照缺字段时回退到批次 output_coverage_factor）
+    def _plan_k(plan_dim: dict[str, Any]) -> float:
+        k_i = plan_dim.get("coverage_factor")
+        if k_i is None:
+            k_i = plan_dim.get("submitted", {}).get("coverage_factor")
+        return float(k_i) if k_i is not None else float(k_out)
+
+    k_dim = np.array([_plan_k(by_id[i]) for i in ids])
+    u_exp_dim = k_dim * u_c                       # U_i = k_i·u_c,i（GUM）
+
     # ---- 保护带宽度
     mode = guard_band["mode"]
     if mode == "multiple":
         h = float(guard_band["multiple"])
-        w_dim = h * k_out * u_c
+        w_dim = h * u_exp_dim
     else:
         w_dim = np.full(k, float(guard_band["fixed_mm"]))
 
@@ -308,6 +325,7 @@ def evaluate_batch(nc: NormalizedChain, plan: dict[str, Any],
     eps_closure = eps @ signs
     sorted_eps = np.sort(eps, axis=0)
     sorted_eps_closure = np.sort(eps_closure)
+    mc_std_dim = eps.std(axis=0, ddof=1)          # 逐尺寸 MC 标准不确定度
     mc_std_closure = float(eps_closure.std(ddof=1))
 
     # ---- 逐尺寸判定
@@ -334,6 +352,10 @@ def evaluate_batch(nc: NormalizedChain, plan: dict[str, Any],
                 "bias_correction_mm": float(bias[j]),
                 "corrected_mm": xc,
                 "decision": dec,
+                "expanded_uncertainty_mm": {
+                    "gum": float(k_dim[j] * u_c[j]),
+                    "monte_carlo": float(k_dim[j] * mc_std_dim[j]),
+                },
                 "p_true_out_of_spec": {
                     "gum": p_out_g, "monte_carlo": p_out_m},
                 "p_true_conforming": {
@@ -347,7 +369,14 @@ def evaluate_batch(nc: NormalizedChain, plan: dict[str, Any],
             "components_mm": plan_dim["components_mm"],
             "variance_share": plan_dim["variance_share"],
             "combined_std_uncertainty_mm": float(u_c[j]),
-            "expanded_uncertainty_mm": float(k_out * u_c[j]),
+            "coverage_factor": float(k_dim[j]),
+            "expanded_uncertainty_mm": float(k_dim[j] * u_c[j]),
+            "monte_carlo": {
+                "std_mm": float(mc_std_dim[j]),
+                "expanded_uncertainty_mm": float(k_dim[j] * mc_std_dim[j]),
+                "samples": mc_samples,
+                "seed": seed,
+            },
             "guard_band_mm": w,
             "accept_interval_mm": [lsl + w, usl - w],
             "items": items,
@@ -405,6 +434,7 @@ def evaluate_batch(nc: NormalizedChain, plan: dict[str, Any],
         },
         "monte_carlo": {
             "std_mm": mc_std_closure,
+            "expanded_uncertainty_mm": k_out * mc_std_closure,
             "samples": mc_samples,
             "seed": seed,
         },
@@ -442,6 +472,10 @@ def evaluate_batch(nc: NormalizedChain, plan: dict[str, Any],
             "bias_correction": "x_c = x + b：先加偏倚修正值，"
                                "残余误差视为零均值，再做不确定度评定与判定",
             "output_coverage_factor": k_out,
+            "coverage_factor_policy": "逐尺寸扩展不确定度使用方案中各量具的"
+                                      "覆盖因子 k_i；封闭环跨多台量具，"
+                                      "使用批次 output_coverage_factor；"
+                                      "GUM 与蒙特卡洛同口径",
             "guard_band": {
                 "mode": mode,
                 "multiple": (float(guard_band["multiple"])

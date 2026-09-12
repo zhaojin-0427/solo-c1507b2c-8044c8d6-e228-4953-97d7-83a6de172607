@@ -317,7 +317,8 @@ class GaugeInput(BaseModel):
 
     * resolution：量具分辨率，标准不确定度按半宽均匀分布 resolution/(2√3)；
     * calibration_expanded_uncertainty + coverage_factor：校准证书扩展
-      不确定度 U 与覆盖因子 k，两者必须成对给出，u_cal = U/k；
+      不确定度 U 与覆盖因子 k，**两者为每个量具声明的必填项**
+      （无校准数据时须显式给 U=0 与对应 k），u_cal = U/k；
     * bias_correction：偏倚修正值（带符号，判定前加到实测值上）；
     * bias_std_uncertainty：该修正值的标准不确定度；
     * repeatability_std：重复性标准差。
@@ -372,6 +373,12 @@ class GaugeInput(BaseModel):
             )
         u_cal = self.calibration_expanded_uncertainty
         k = self.coverage_factor
+        if u_cal is None and k is None:
+            raise ValueError(
+                f"尺寸 {self.dimension_id}: 校准扩展不确定度与覆盖因子缺失"
+                "（每个量具声明都必须给出校准扩展不确定度 U 及其覆盖因子 k；"
+                "无校准数据时请显式给 U=0 与对应 k）"
+            )
         if u_cal is not None and k is None:
             raise ValueError(
                 f"尺寸 {self.dimension_id}: 已给校准扩展不确定度，"

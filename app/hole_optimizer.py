@@ -161,11 +161,11 @@ def _apply_candidate(model: HoleModel, drill: dict, fastener: dict,
             m.bolt_lo[i] = choice["lower"]
             m.bolt_hi[i] = choice["upper"]
         else:
-            # 固定螺栓（无 feature_b 的合成销）：直接改 B 侧销直径
+            # 固定销 / 无 feature_b 的合成固定螺栓：改外要素直径（下偏差带符号）
             pin = m.features_b[i] if m.ext_sides[i] == "B" else m.features_a[i]
             pin.nom = mid_d
             pin.es = choice["upper"] - mid_d
-            pin.ei = mid_d - choice["lower"]
+            pin.ei = choice["lower"] - mid_d
     return m, radius, enlarge, correction_shift
 
 
@@ -425,15 +425,15 @@ def freeze_payload(model: HoleModel, candidate: dict, name: str, note: str,
             m["bolt_diameter_upper"] = up
             m["bolt_diameter_lower"] = lo
         elif m.get("feature_b") and m["feature_b"]["kind"] == "pin":
-            # 固定销配合：换 B 侧销直径（对称偏差）
+            # 固定销配合：换 B 侧销直径（上下偏差带符号，下偏差为负）
             m["feature_b"]["nominal_diameter"] = 0.5 * (up + lo)
             m["feature_b"]["diameter_upper_deviation"] = up - 0.5 * (up + lo)
-            m["feature_b"]["diameter_lower_deviation"] = 0.5 * (up + lo) - lo
+            m["feature_b"]["diameter_lower_deviation"] = lo - 0.5 * (up + lo)
         else:
             # 固定螺栓（无 feature_b）：改螺栓直径极限
             m["bolt_diameter_upper"] = up
             m["bolt_diameter_lower"] = lo
-    data["random_seed"] = model.seed
+    # 抽样种子/样本数已在函数开头按入参写入；不得再用父版本值覆盖
     data["adopted_remedy"] = {
         "drill": candidate["drill"],
         "fasteners": candidate["fasteners"],

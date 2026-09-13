@@ -561,6 +561,90 @@ def test_bolt_diameter_samples_cover_full_interval():
     assert pin.mean() == pytest.approx(10.0, abs=0.05)
 
 
+def test_adopted_fixed_pin_uses_signed_lower_deviation():
+    """采纳固定销 9~11 规格：下偏差必须为负，重建后抽样覆盖完整区间。"""
+    from app.hole_optimizer import freeze_payload, search_remedies
+    from app.holes import sample_realization
+
+    def pinmate(mid, x):
+        h = dict(kind="hole", x=x, y=0, nominal_diameter=10.0,
+                 diameter_upper_deviation=0.0, diameter_lower_deviation=0.0,
+                 position_tolerance=0.0, material_condition="RFS",
+                 distribution="uniform")
+        p = dict(kind="pin", x=x, y=0, nominal_diameter=9.8,
+                 diameter_upper_deviation=0.0, diameter_lower_deviation=-0.0,
+                 position_tolerance=0.0, material_condition="RFS",
+                 distribution="uniform")
+        return {"id": mid, "feature_a": h, "feature_b": p}
+
+    p = HolePatternCreate(name="pin-adopt", mc_samples=2000, random_seed=20260913,
+                          theta_search_deg=1.0, theta_grid_points=21,
+                          mc_theta_points=3,
+                          mates=[pinmate("M1", 0), pinmate("M2", 40)])
+    model = build_model(p)
+    req = RemedySearchRequest(
+        name="r", mc_samples=1000, random_seed=7,
+        fastener_options=[
+            {"mate_id": "M1", "diameter_upper": 11.0, "diameter_lower": 9.0},
+            {"mate_id": "M2", "diameter_upper": 11.0, "diameter_lower": 9.0}])
+    res = search_remedies(model, req)
+    top = min((c for c in res["candidates"] if c["fasteners"]),
+              key=lambda c: c["rank"])
+    new_payload = freeze_payload(model, top, "adopted", "", p,
+                                 mc_samples=1000, seed=7)
+    fb = new_payload.mates[0].feature_b
+    assert fb.diameter_lower_deviation < 0
+    assert fb.diameter_upper_deviation > 0
+    rebuilt = build_model(new_payload)
+    samples = sample_realization(rebuilt, 5000, seed=7)["diameters"][("B", 0)]
+    assert samples.min() < 9.3 and samples.max() > 10.7
+    # 重算失败概率与候选一致
+    adopted_mc = analyze(new_payload)["monte_carlo"]
+    assert abs(adopted_mc["failure_probability"]
+               - top["failure_probability"]) < 0.02
+
+
+def test_freeze_payload_remedy_seed_overrides_parent():
+    """整改种子与父版本不同：采纳版本的 submitted/重算必须用整改种子。"""
+    from app.hole_optimizer import freeze_payload, search_remedies
+
+    def mate(mid, ax, bx):
+        f = dict(kind="hole", nominal_diameter=10.0,
+                 diameter_upper_deviation=0.0, diameter_lower_deviation=0.0,
+                 position_tolerance=0.0, material_condition="RFS",
+                 distribution="uniform")
+        p = dict(kind="pin", nominal_diameter=9.8,
+                 diameter_upper_deviation=0.0, diameter_lower_deviation=-0.0,
+                 position_tolerance=0.0, material_condition="RFS",
+                 distribution="uniform")
+        return {"id": mid,
+                "feature_a": {**f, "x": ax, "y": 0},
+                "feature_b": {**p, "x": bx, "y": 0}}
+
+    p = HolePatternCreate(name="seed-adopt", mc_samples=2000,
+                          random_seed=20260913, theta_search_deg=1.0,
+                          theta_grid_points=21, mc_theta_points=3,
+                          mates=[mate("M1", 0, 0), mate("M2", 40, 40)])
+    model = build_model(p)
+    req = RemedySearchRequest(
+        name="r", mc_samples=1000, random_seed=7,
+        fastener_options=[
+            {"mate_id": "M1", "diameter_upper": 11.0, "diameter_lower": 9.0},
+            {"mate_id": "M2", "diameter_upper": 11.0, "diameter_lower": 9.0}])
+    res = search_remedies(model, req)
+    top = min((c for c in res["candidates"] if c["fasteners"]),
+              key=lambda c: c["rank"])
+    new_payload = freeze_payload(model, top, "adopted", "", p,
+                                 mc_samples=1000, seed=7)
+    assert new_payload.random_seed == 7
+    assert new_payload.mc_samples == 1000
+    store = new_payload.model_dump(mode="json")
+    assert store["random_seed"] == 7 and store["mc_samples"] == 1000
+    # 同种子同样本：候选与采纳重算的失败概率完全一致
+    assert analyze(new_payload)["monte_carlo"]["failure_probability"] == \
+        top["failure_probability"]
+
+
 def test_correction_shift_is_deterministic_and_frozen():
     """孔位修正导出确定性平移矢量：采纳后重算失败概率与候选一致。"""
     from app.hole_optimizer import freeze_payload, search_remedies
@@ -732,3 +816,51 @@ def test_api_adopt_keeps_correction_samples_and_seed(client):
     got = client.get(f"/hole-versions/{v['version_id']}").json()
     assert got["result"]["monte_carlo"]["failure_probability"] == 0.0
     assert got["mc_samples"] == 1000
+
+
+def test_api_adopt_remedy_seed_and_fixed_pin(client):
+    """采纳整改：整改种子不同于父版本时，submitted/重算都用整改种子；
+    固定销 9~11 按有符号下偏差保存，重算失败概率与候选一致。"""
+    hole = dict(kind="hole", nominal_diameter=10.0,
+                diameter_upper_deviation=0.0, diameter_lower_deviation=0.0,
+                position_tolerance=0.0, material_condition="RFS",
+                distribution="uniform")
+
+    def pinmate(mid, x, d=9.8):
+        return {"id": mid,
+                "feature_a": {**hole, "x": x, "y": 0},
+                "feature_b": dict(kind="pin", x=x, y=0, nominal_diameter=d,
+                                  diameter_upper_deviation=0.0,
+                                  diameter_lower_deviation=-0.0,
+                                  position_tolerance=0.0,
+                                  material_condition="RFS",
+                                  distribution="uniform")}
+
+    parent = {"name": "api-pin-seed", "mc_samples": 2000,
+              "random_seed": 20260913, "theta_search_deg": 1.0,
+              "theta_grid_points": 21, "mc_theta_points": 3,
+              "mates": [pinmate("M1", 0), pinmate("M2", 40)]}
+    vid = client.post("/hole-patterns", json=parent).json()["version_id"]
+    rem = {"name": "r", "mc_samples": 1000, "random_seed": 7,
+           "fastener_options": [
+               {"mate_id": "M1", "diameter_upper": 11.0,
+                "diameter_lower": 9.0},
+               {"mate_id": "M2", "diameter_upper": 11.0,
+                "diameter_lower": 9.0}]}
+    rj = client.post(f"/hole-versions/{vid}/remedies", json=rem).json()
+    cand = min((c for c in rj["result"]["candidates"] if c["fasteners"]),
+               key=lambda c: c["rank"])
+    v = client.post(f"/hole-remedies/{rj['remedy_id']}/select",
+                    json={"rank": cand["rank"]}).json()
+    nmc = v["result"]["monte_carlo"]
+    assert v["submitted_input"]["random_seed"] == 7
+    assert nmc["random_seed"] == 7 and nmc["samples"] == 1000
+    assert v["mc_samples"] == 1000
+    fb = v["submitted_input"]["mates"][0]["feature_b"]
+    assert fb["diameter_lower_deviation"] < 0
+    assert nmc["failure_probability"] == cand["failure_probability"]
+    # 重新读取冻结版本：结果不变
+    got = client.get(f"/hole-versions/{v['version_id']}").json()
+    assert got["submitted_input"]["random_seed"] == 7
+    assert got["result"]["monte_carlo"]["failure_probability"] == \
+        cand["failure_probability"]

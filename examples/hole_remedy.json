@@ -1,0 +1,28 @@
+{
+  "name": "法兰整改搜索",
+  "note": "放大 M1/M2 孔、换细螺栓或修正孔位；按失败概率/改动量排序",
+  "locked_mates": ["M3"],
+  "locked_fasteners": [],
+  "drill_options": [
+    {"mate_id": "M1", "side": "a",
+     "nominal_diameter": 10.5,
+     "diameter_upper_deviation": 0.1,
+     "diameter_lower_deviation": 0.0},
+    {"mate_id": "M2", "side": "a",
+     "nominal_diameter": 10.5,
+     "diameter_upper_deviation": 0.1,
+     "diameter_lower_deviation": 0.0}
+  ],
+  "fastener_options": [
+    {"mate_id": "M1", "diameter_upper": 9.55, "diameter_lower": 9.45},
+    {"mate_id": "M4", "diameter_upper": 9.55, "diameter_lower": 9.45}
+  ],
+  "correction_options": [
+    {"mate_id": "M1", "max_shift": 0.3},
+    {"mate_id": "M2", "max_shift": 0.3},
+    {"mate_id": "M4", "max_shift": 0.3}
+  ],
+  "include_correction": true,
+  "max_candidates": 200,
+  "mc_samples": 20000
+}

@@ -50,6 +50,19 @@ from .engine import (
     normalize_chain,
 )
 from .gage_rr import run_study
+from .hole_optimizer import RemedyError, freeze_payload, search_remedies
+from .hole_schemas import (
+    HolePatternCreate,
+    HolePatternVersionCreate,
+    RemedySearchRequest,
+    RemedySelectRequest,
+)
+from .holes import (
+    HoleError,
+    analyze as analyze_hole,
+    build_model as build_hole_model,
+    model_snapshot as hole_model_snapshot,
+)
 from .inspection import analyze_batch, baseline_comparison, validate_rows
 from .measurement import evaluate_batch, normalize_plan
 from .optimizer import search_cost_targets
@@ -1787,4 +1800,249 @@ def select_process_candidate(solution_id: int,
     answer["freeze_note"] = (
         "已冻结设计链快照、工序路线、传递矩阵与随机种子；来源链更新不"
         "改写本方案。后续工序指导应引用本反算结果与版本快照。")
+    return answer
+
+
+# -------------------------------------------------------- 孔系装配分析
+
+def _hole_version_payload(pattern_row, version_row) -> dict:
+    return {
+        "pattern_id": pattern_row.id,
+        "pattern_name": pattern_row.name,
+        "version_id": version_row.id,
+        "version_no": version_row.version_no,
+        "parent_version_id": version_row.parent_version_id,
+        "name": version_row.name,
+        "note": version_row.note,
+        "frozen": True,
+        "created_at": version_row.created_at.isoformat(),
+        "submitted_input": version_row.request_json,
+        "snapshot": version_row.snapshot_json,
+        "result": version_row.result_json,
+        "mc_samples": version_row.mc_samples,
+        "random_seed": version_row.random_seed,
+    }
+
+
+@app.post("/hole-patterns", status_code=201, tags=["holes"])
+def create_hole_pattern(payload: HolePatternCreate) -> dict:
+    """创建孔系装配分析（一对零件的孔 / 销 / 螺栓 + 两侧基准框架，版本 1）。
+
+    Pydantic 逐匹配位校验名义坐标、孔径与连接件直径极限（倒置拒绝）、
+    位置度与 MMC/LMC/RFS 实体条件；基准框架校验优先次序、基准要素尺寸
+    与实体条件（自由度重复/欠约束、平行边线退化、位置度引用无效拒绝）；
+    匹配缺失（重复 id / B 侧空缺 / 双外要素 / 双孔无螺栓）指出对象并拒绝。
+    系统合并尺寸偏差、实体状态补偿公差与基准偏移，在最坏边界（VC 圆盘
+    公共交集）与固定种子蒙特卡洛中求能容纳全部连接件的平移与转角，
+    返回装配成功率、可行位姿范围、最先干涉匹配位与逐项余量贡献。
+    规范化 mm 快照与随机种子随版本冻结写入 SQLite。
+    """
+    try:
+        result = analyze_hole(payload)
+    except HoleError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    model = build_hole_model(payload)
+    snapshot = hole_model_snapshot(model)
+    pattern_id, version_id = db.save_hole_first_version(
+        payload.name, payload.note, payload.model_dump(mode="json"),
+        snapshot, result, payload.mc_samples, payload.random_seed)
+    return _hole_version_payload(
+        db.get_hole_pattern(pattern_id), db.get_hole_version(version_id))
+
+
+@app.get("/hole-patterns", tags=["holes"])
+def list_hole_patterns() -> dict:
+    return {"hole_patterns": db.list_hole_patterns()}
+
+
+def _load_hole_version(version_id: int):
+    row = db.get_hole_version(version_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"孔系版本 {version_id} 不存在")
+    return row
+
+
+@app.get("/hole-versions/{version_id}", tags=["holes"])
+def get_hole_version(version_id: int) -> dict:
+    """读取冻结孔系版本：快照与结果创建时固化，重复读取内容不变。"""
+    version_row = _load_hole_version(version_id)
+    pattern_row = db.get_hole_pattern(version_row.pattern_id)
+    return _hole_version_payload(pattern_row, version_row)
+
+
+@app.post("/hole-patterns/{pattern_id}/versions", status_code=201,
+          tags=["holes"])
+def create_hole_version(pattern_id: int,
+                        payload: HolePatternVersionCreate) -> dict:
+    """在同一孔系对象下另建独立版本（完整新定义随版本冻结，历史不回改）。
+
+    parent_version_id 仅记血缘（缺省取最新版本）。
+    """
+    pattern_row = db.get_hole_pattern(pattern_id)
+    if pattern_row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"孔系对象 {pattern_id} 不存在")
+    versions = db.list_hole_versions(pattern_id)
+    if payload.parent_version_id is not None:
+        parent_ids = {v.id for v in versions}
+        if payload.parent_version_id not in parent_ids:
+            raise HTTPException(
+                status_code=404,
+                detail=f"孔系 {pattern_id} 下父版本 "
+                       f"{payload.parent_version_id} 不存在")
+        parent_id = payload.parent_version_id
+    else:
+        parent_id = versions[-1].id if versions else None
+    try:
+        result = analyze_hole(payload)
+    except HoleError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    model = build_hole_model(payload)
+    snapshot = hole_model_snapshot(model)
+    new_no = max((v.version_no for v in versions), default=0) + 1
+    version_id = db.save_hole_version(
+        pattern_id, new_no, parent_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), snapshot, result,
+        payload.mc_samples, payload.random_seed)
+    return _hole_version_payload(pattern_row,
+                                 db.get_hole_version(version_id))
+
+
+@app.post("/hole-versions/{version_id}/remedies", status_code=201,
+          tags=["holes"])
+def create_hole_remedy(version_id: int,
+                       payload: RemedySearchRequest) -> dict:
+    """搜索整改组合：候选钻孔尺寸 / 连接件规格 / 允许孔位修正。
+
+    可锁定孔位（locked_mates，禁孔位修正）或连接件（locked_fasteners，
+    禁换规格）；候选引用不存在匹配位、对非孔要素钻孔、候选孔径不放大、
+    锁与候选冲突时拒绝（422）并指出对象。所有候选共用固定种子同源样本，
+    按「失败概率 → 最大孔位改动 → 孔径放大总量」升序排列，零改动现状
+    方案始终参与复核。候选表与种子随结果冻结。
+    """
+    version_row = _load_hole_version(version_id)
+    parent_payload = HolePatternCreate.model_validate(
+        version_row.request_json)
+    model = build_hole_model(parent_payload)
+    try:
+        result = search_remedies(model, payload)
+    except RemedyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    result["frozen_inputs"] = {
+        "version_id": version_id,
+        "pattern_id": version_row.pattern_id,
+        "parent_random_seed": version_row.random_seed,
+        "candidate_table": payload.model_dump(mode="json"),
+    }
+    remedy_id = db.save_hole_remedy(
+        version_row.pattern_id, version_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), result)
+    saved = db.get_hole_remedy(remedy_id)
+    return {
+        "remedy_id": saved.id,
+        "pattern_id": saved.pattern_id,
+        "version_id": saved.version_id,
+        "name": saved.name,
+        "note": saved.note,
+        "created_at": saved.created_at.isoformat(),
+        "submitted_input": saved.request_json,
+        "result": saved.result_json,
+    }
+
+
+@app.get("/hole-versions/{version_id}/remedies", tags=["holes"])
+def list_hole_remedies(version_id: int) -> dict:
+    _load_hole_version(version_id)
+    return {"version_id": version_id,
+            "remedies": db.list_hole_remedies(version_id)}
+
+
+@app.get("/hole-remedies/{remedy_id}", tags=["holes"])
+def get_hole_remedy(remedy_id: int) -> dict:
+    row = db.get_hole_remedy(remedy_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"孔系整改结果 {remedy_id} 不存在")
+    return {
+        "remedy_id": row.id,
+        "pattern_id": row.pattern_id,
+        "version_id": row.version_id,
+        "name": row.name,
+        "note": row.note,
+        "frozen": bool(row.frozen),
+        "selected_rank": row.selected_rank,
+        "selected_version_id": row.selected_version_id,
+        "created_at": row.created_at.isoformat(),
+        "submitted_input": row.request_json,
+        "result": row.result_json,
+    }
+
+
+@app.post("/hole-remedies/{remedy_id}/select", tags=["holes"])
+def select_hole_remedy(remedy_id: int, payload: RemedySelectRequest) -> dict:
+    """采纳整改候选并冻结：按候选放大孔径 / 更换连接件创建新版本。
+
+    新版本冻结输入孔系、匹配关系与随机种子；每个整改结果只能采纳一次
+    （重复采纳或改选返回 422），历史版本不改写。
+    """
+    remedy_row = db.get_hole_remedy(remedy_id)
+    if remedy_row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"孔系整改结果 {remedy_id} 不存在")
+    if remedy_row.frozen:
+        raise HTTPException(
+            status_code=422,
+            detail=f"整改结果 {remedy_id} 已采纳 rank="
+                   f"{remedy_row.selected_rank} 并冻结（新版本 "
+                   f"{remedy_row.selected_version_id}），不能改选；"
+                   "请在新版本上另建整改搜索")
+    candidates = remedy_row.result_json.get("candidates", [])
+    if payload.rank > len(candidates):
+        raise HTTPException(
+            status_code=422,
+            detail=f"rank={payload.rank} 超出候选数 {len(candidates)}")
+    chosen = next(c for c in candidates if c["rank"] == payload.rank)
+    parent_version = db.get_hole_version(remedy_row.version_id)
+    parent_payload = HolePatternCreate.model_validate(
+        parent_version.request_json)
+    model = build_hole_model(parent_payload)
+    adopted_name = f"{remedy_row.name}-采纳"
+    new_payload = freeze_payload(
+        model, chosen, adopted_name, payload.note or remedy_row.note,
+        parent_payload)
+    result = analyze_hole(new_payload)
+    new_model = build_hole_model(new_payload)
+    pattern_versions = db.list_hole_versions(remedy_row.pattern_id)
+    new_no = max(v.version_no for v in pattern_versions) + 1
+    adopted_meta = {
+        "remedy_id": remedy_row.id,
+        "rank": payload.rank,
+        "drill": chosen["drill"],
+        "fasteners": chosen["fasteners"],
+        "uses_hole_correction": chosen["uses_hole_correction"],
+        "hole_correction_budget_mm": chosen["hole_correction_budget_mm"],
+        "frozen": "采纳结果冻结输入孔系、匹配关系与随机种子",
+    }
+    request_store = new_payload.model_dump(mode="json")
+    request_store["adopted_remedy"] = adopted_meta
+    result = {**result, "adopted_remedy": adopted_meta}
+    new_version_id = db.save_hole_version(
+        remedy_row.pattern_id, new_no, parent_version.id,
+        adopted_name, payload.note, request_store,
+        hole_model_snapshot(new_model), result,
+        new_payload.random_seed, new_payload.random_seed)
+    db.freeze_hole_remedy(remedy_row.id, payload.rank, payload.note,
+                          new_version_id)
+    saved_remedy = db.get_hole_remedy(remedy_row.id)
+    answer = _hole_version_payload(
+        db.get_hole_pattern(remedy_row.pattern_id),
+        db.get_hole_version(new_version_id))
+    answer["adopted_from"] = {
+        "remedy_id": remedy_row.id,
+        "rank": payload.rank,
+        "selected_candidate": chosen,
+        "frozen_remedy": bool(saved_remedy.frozen),
+        "freeze_note": "已冻结输入孔系、匹配关系与随机种子；历史版本不改写",
+    }
     return answer

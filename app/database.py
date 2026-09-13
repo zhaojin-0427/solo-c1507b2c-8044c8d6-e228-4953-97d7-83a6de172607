@@ -11,6 +11,9 @@
 * networks           多闭环公差网络（版本线；共享尺寸池的多个功能要求）
 * network_versions   网络版本（尺寸池/闭环/相关矩阵快照 + 结果，冻结）
 * network_scenarios  网络方案分支搜索结果（锁定尺寸 + 批量调整，冻结）
+* hole_patterns      孔系装配对象（版本线；一对零件的孔/销/螺栓与基准框架）
+* hole_versions      孔系版本（匹配位/基准框架快照 + WC/MC 结果，冻结）
+* hole_remedies      孔系整改搜索结果（候选钻孔/连接件/孔位修正；采纳后冻结）
 """
 from __future__ import annotations
 
@@ -335,6 +338,67 @@ class ProcessSolutionRow(Base):
     request_json: Mapped[dict] = mapped_column(JSON)
     result_json: Mapped[dict] = mapped_column(JSON)
     selected_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    selected_note: Mapped[str] = mapped_column(Text, default="")
+    frozen: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class HolePatternRow(Base):
+    """孔系装配对象（版本线）：一对零件的孔 / 销 / 螺栓与基准框架。"""
+
+    __tablename__ = "hole_patterns"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class HoleVersionRow(Base):
+    """孔系版本：匹配位 / 基准框架 / 抽样配置与结果随版本冻结，不回改。"""
+
+    __tablename__ = "hole_versions"
+    __table_args__ = (
+        UniqueConstraint("pattern_id", "version_no",
+                         name="uq_hole_pattern_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    pattern_id: Mapped[int] = mapped_column(
+        ForeignKey("hole_patterns.id", ondelete="CASCADE"), index=True
+    )
+    version_no: Mapped[int] = mapped_column(Integer)
+    parent_version_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True)
+    name: Mapped[str] = mapped_column(String(200))
+    note: Mapped[str] = mapped_column(Text, default="")
+    request_json: Mapped[dict] = mapped_column(JSON)
+    snapshot_json: Mapped[dict] = mapped_column(JSON)
+    result_json: Mapped[dict] = mapped_column(JSON)
+    mc_samples: Mapped[int] = mapped_column(Integer)
+    random_seed: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class HoleRemedyRow(Base):
+    """孔系整改搜索结果：候选钻孔 / 连接件 / 孔位修正随请求冻结；采纳后固化。"""
+
+    __tablename__ = "hole_remedies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    pattern_id: Mapped[int] = mapped_column(
+        ForeignKey("hole_patterns.id", ondelete="CASCADE"), index=True
+    )
+    version_id: Mapped[int] = mapped_column(
+        ForeignKey("hole_versions.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    request_json: Mapped[dict] = mapped_column(JSON)
+    result_json: Mapped[dict] = mapped_column(JSON)
+    selected_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    selected_version_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True)
     selected_note: Mapped[str] = mapped_column(Text, default="")
     frozen: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
@@ -1091,6 +1155,149 @@ def freeze_process_solution(solution_id: int, rank: int, note: str) -> None:
     with session_factory() as s:
         row = s.get(ProcessSolutionRow, solution_id)
         row.selected_rank = rank
+        row.selected_note = note
+        row.frozen = 1
+        s.commit()
+
+
+# ------------------------------------------------------- 孔系装配 CRUD
+
+def save_hole_first_version(name: str, note: str, request: dict,
+                            snapshot: dict, result: dict,
+                            mc_samples: int, seed: int) -> tuple[int, int]:
+    """事务性创建孔系对象行与版本 1，返回 (pattern_id, version_id)。"""
+    with session_factory() as s:
+        pattern = HolePatternRow(name=name, note=note)
+        s.add(pattern)
+        s.flush()
+        version = HoleVersionRow(
+            pattern_id=pattern.id, version_no=1, parent_version_id=None,
+            name=name, note=note, request_json=request,
+            snapshot_json=snapshot, result_json=result,
+            mc_samples=mc_samples, random_seed=seed)
+        s.add(version)
+        s.commit()
+        return pattern.id, version.id
+
+
+def save_hole_version(pattern_id: int, version_no: int,
+                      parent_version_id: int | None, name: str, note: str,
+                      request: dict, snapshot: dict, result: dict,
+                      mc_samples: int, seed: int) -> int:
+    with session_factory() as s:
+        version = HoleVersionRow(
+            pattern_id=pattern_id, version_no=version_no,
+            parent_version_id=parent_version_id, name=name, note=note,
+            request_json=request, snapshot_json=snapshot,
+            result_json=result, mc_samples=mc_samples, random_seed=seed)
+        s.add(version)
+        s.commit()
+        return version.id
+
+
+def get_hole_pattern(pattern_id: int) -> HolePatternRow | None:
+    with session_factory() as s:
+        row = s.get(HolePatternRow, pattern_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_hole_patterns() -> list[dict]:
+    with session_factory() as s:
+        patterns = s.scalars(
+            select(HolePatternRow).order_by(HolePatternRow.id)).all()
+        out = []
+        for p in patterns:
+            versions = s.scalars(
+                select(HoleVersionRow)
+                .where(HoleVersionRow.pattern_id == p.id)
+                .order_by(HoleVersionRow.version_no)).all()
+            out.append({
+                "pattern_id": p.id,
+                "name": p.name,
+                "note": p.note,
+                "created_at": p.created_at.isoformat(),
+                "versions": [
+                    {"version_id": v.id, "version_no": v.version_no,
+                     "parent_version_id": v.parent_version_id,
+                     "note": v.note, "mc_samples": v.mc_samples,
+                     "random_seed": v.random_seed,
+                     "mates": len(v.snapshot_json["mates"]),
+                     "worst_case_feasible":
+                         v.result_json["worst_case"]["feasible"],
+                     "assembly_success_rate":
+                         v.result_json["monte_carlo"]
+                         ["assembly_success_rate"],
+                     "created_at": v.created_at.isoformat()}
+                    for v in versions],
+            })
+        return out
+
+
+def get_hole_version(version_id: int) -> HoleVersionRow | None:
+    with session_factory() as s:
+        row = s.get(HoleVersionRow, version_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_hole_versions(pattern_id: int) -> list[HoleVersionRow]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(HoleVersionRow)
+            .where(HoleVersionRow.pattern_id == pattern_id)
+            .order_by(HoleVersionRow.version_no)).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def save_hole_remedy(pattern_id: int, version_id: int, name: str, note: str,
+                     request: dict, result: dict) -> int:
+    with session_factory() as s:
+        row = HoleRemedyRow(
+            pattern_id=pattern_id, version_id=version_id, name=name,
+            note=note, request_json=request, result_json=result)
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def get_hole_remedy(remedy_id: int) -> HoleRemedyRow | None:
+    with session_factory() as s:
+        row = s.get(HoleRemedyRow, remedy_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_hole_remedies(version_id: int) -> list[dict]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(HoleRemedyRow)
+            .where(HoleRemedyRow.version_id == version_id)
+            .order_by(HoleRemedyRow.id)).all()
+        return [
+            {"remedy_id": r.id, "pattern_id": r.pattern_id,
+             "version_id": r.version_id, "name": r.name, "note": r.note,
+             "frozen": bool(r.frozen),
+             "selected_rank": r.selected_rank,
+             "selected_version_id": r.selected_version_id,
+             "candidate_count": len(r.result_json.get("candidates", [])),
+             "created_at": r.created_at.isoformat()}
+            for r in rows
+        ]
+
+
+def freeze_hole_remedy(remedy_id: int, rank: int, note: str,
+                       new_version_id: int) -> None:
+    """采纳：写入 rank、新版本 id 并置 frozen=1（调用方保证只采纳一次）。"""
+    with session_factory() as s:
+        row = s.get(HoleRemedyRow, remedy_id)
+        row.selected_rank = rank
+        row.selected_version_id = new_version_id
         row.selected_note = note
         row.frozen = 1
         s.commit()

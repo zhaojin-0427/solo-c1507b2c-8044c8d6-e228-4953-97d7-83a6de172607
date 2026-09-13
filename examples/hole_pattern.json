@@ -1,0 +1,244 @@
+{
+  "name": "四孔法兰-浮动螺栓",
+  "note": "两零件各 4 个 Φ10 通孔（MMC），9.5/9.6 浮动螺栓；两侧 3-2-1 边线基准框架",
+  "unit": "mm",
+  "mates": [
+    {
+      "id": "M1",
+      "feature_a": {
+        "kind": "hole",
+        "x": 0.0,
+        "y": 0.0,
+        "nominal_diameter": 10.0,
+        "diameter_upper_deviation": 0.1,
+        "diameter_lower_deviation": 0.0,
+        "position_tolerance": 0.1,
+        "material_condition": "MMC",
+        "distribution": "normal",
+        "diameter_std_dev": 0.02,
+        "position_std_dev": 0.02,
+        "position_datum_refs": [
+          "A",
+          "B"
+        ]
+      },
+      "feature_b": {
+        "kind": "hole",
+        "x": 0.0,
+        "y": 0.0,
+        "nominal_diameter": 10.0,
+        "diameter_upper_deviation": 0.1,
+        "diameter_lower_deviation": 0.0,
+        "position_tolerance": 0.1,
+        "material_condition": "MMC",
+        "distribution": "normal",
+        "diameter_std_dev": 0.02,
+        "position_std_dev": 0.02,
+        "position_datum_refs": [
+          "A",
+          "B"
+        ]
+      },
+      "bolt_diameter_upper": 9.6,
+      "bolt_diameter_lower": 9.5
+    },
+    {
+      "id": "M2",
+      "feature_a": {
+        "kind": "hole",
+        "x": 50.0,
+        "y": 0.0,
+        "nominal_diameter": 10.0,
+        "diameter_upper_deviation": 0.1,
+        "diameter_lower_deviation": 0.0,
+        "position_tolerance": 0.1,
+        "material_condition": "MMC",
+        "distribution": "normal",
+        "diameter_std_dev": 0.02,
+        "position_std_dev": 0.02,
+        "position_datum_refs": [
+          "A",
+          "B"
+        ]
+      },
+      "feature_b": {
+        "kind": "hole",
+        "x": 50.0,
+        "y": 0.0,
+        "nominal_diameter": 10.0,
+        "diameter_upper_deviation": 0.1,
+        "diameter_lower_deviation": 0.0,
+        "position_tolerance": 0.1,
+        "material_condition": "MMC",
+        "distribution": "normal",
+        "diameter_std_dev": 0.02,
+        "position_std_dev": 0.02,
+        "position_datum_refs": [
+          "A",
+          "B"
+        ]
+      },
+      "bolt_diameter_upper": 9.6,
+      "bolt_diameter_lower": 9.5
+    },
+    {
+      "id": "M3",
+      "feature_a": {
+        "kind": "hole",
+        "x": 50.0,
+        "y": 50.0,
+        "nominal_diameter": 10.0,
+        "diameter_upper_deviation": 0.1,
+        "diameter_lower_deviation": 0.0,
+        "position_tolerance": 0.1,
+        "material_condition": "MMC",
+        "distribution": "normal",
+        "diameter_std_dev": 0.02,
+        "position_std_dev": 0.02,
+        "position_datum_refs": [
+          "A",
+          "B"
+        ]
+      },
+      "feature_b": {
+        "kind": "hole",
+        "x": 50.0,
+        "y": 50.0,
+        "nominal_diameter": 10.0,
+        "diameter_upper_deviation": 0.1,
+        "diameter_lower_deviation": 0.0,
+        "position_tolerance": 0.1,
+        "material_condition": "MMC",
+        "distribution": "normal",
+        "diameter_std_dev": 0.02,
+        "position_std_dev": 0.02,
+        "position_datum_refs": [
+          "A",
+          "B"
+        ]
+      },
+      "bolt_diameter_upper": 9.6,
+      "bolt_diameter_lower": 9.5
+    },
+    {
+      "id": "M4",
+      "feature_a": {
+        "kind": "hole",
+        "x": 0.0,
+        "y": 50.0,
+        "nominal_diameter": 10.0,
+        "diameter_upper_deviation": 0.1,
+        "diameter_lower_deviation": 0.0,
+        "position_tolerance": 0.1,
+        "material_condition": "MMC",
+        "distribution": "normal",
+        "diameter_std_dev": 0.02,
+        "position_std_dev": 0.02,
+        "position_datum_refs": [
+          "A",
+          "B"
+        ]
+      },
+      "feature_b": {
+        "kind": "hole",
+        "x": 0.0,
+        "y": 50.0,
+        "nominal_diameter": 10.0,
+        "diameter_upper_deviation": 0.1,
+        "diameter_lower_deviation": 0.0,
+        "position_tolerance": 0.1,
+        "material_condition": "MMC",
+        "distribution": "normal",
+        "diameter_std_dev": 0.02,
+        "position_std_dev": 0.02,
+        "position_datum_refs": [
+          "A",
+          "B"
+        ]
+      },
+      "bolt_diameter_upper": 9.6,
+      "bolt_diameter_lower": 9.5
+    }
+  ],
+  "frame_a": {
+    "datums": [
+      {
+        "label": "A",
+        "order": 1,
+        "kind": "edge",
+        "constrains": [
+          "ty"
+        ],
+        "material_condition": "RFS",
+        "normal_x": 0.0,
+        "normal_y": 1.0
+      },
+      {
+        "label": "B",
+        "order": 2,
+        "kind": "edge",
+        "constrains": [
+          "tx"
+        ],
+        "material_condition": "RFS",
+        "normal_x": 1.0,
+        "normal_y": 0.0
+      },
+      {
+        "label": "C",
+        "order": 3,
+        "kind": "edge",
+        "constrains": [
+          "rz"
+        ],
+        "material_condition": "RFS",
+        "normal_x": 1.0,
+        "normal_y": 0.0,
+        "angular_half_range_deg": 0.05
+      }
+    ]
+  },
+  "frame_b": {
+    "datums": [
+      {
+        "label": "A",
+        "order": 1,
+        "kind": "edge",
+        "constrains": [
+          "ty"
+        ],
+        "material_condition": "RFS",
+        "normal_x": 0.0,
+        "normal_y": 1.0
+      },
+      {
+        "label": "B",
+        "order": 2,
+        "kind": "edge",
+        "constrains": [
+          "tx"
+        ],
+        "material_condition": "RFS",
+        "normal_x": 1.0,
+        "normal_y": 0.0
+      },
+      {
+        "label": "C",
+        "order": 3,
+        "kind": "edge",
+        "constrains": [
+          "rz"
+        ],
+        "material_condition": "RFS",
+        "normal_x": 1.0,
+        "normal_y": 0.0,
+        "angular_half_range_deg": 0.05
+      }
+    ]
+  },
+  "mc_samples": 20000,
+  "random_seed": 20260913,
+  "theta_search_deg": 5.0,
+  "theta_grid_points": 121,
+  "mc_theta_points": 9
+}

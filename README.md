@@ -109,6 +109,12 @@ python3 -m venv --without-pip .venv        # 若 venv 自带 pip 可省略 get-p
 | POST | `/process-plan-versions/{vid}/solve` | 锁定已定工序尺寸、反算其余名义（LP 范围 + 消元 + WC/RSS/MC + 多解排序） |
 | GET | `/process-plan-versions/{vid}/solutions` / `/process-solutions/{id}` | 反算结果列表 / 冻结结果 |
 | POST | `/process-solutions/{id}/select` | 选定候选并冻结（只能选一次，来源更新不改写历史方案） |
+| POST | `/hole-patterns` | 创建**孔系装配分析**（版本 1：匹配位孔/销/螺栓 + 两侧基准框架，WC + 固定种子 MC） |
+| GET | `/hole-patterns` / `/hole-versions/{vid}` | 孔系列表（含版本线） / 读取冻结版本（快照与结果创建时固化） |
+| POST | `/hole-patterns/{id}/versions` | 同一孔系对象下另建独立版本（完整新定义随版本冻结） |
+| POST | `/hole-versions/{vid}/remedies` | 整改组合搜索（候选钻孔/连接件/孔位修正，按失败概率与改动量排序） |
+| GET | `/hole-versions/{vid}/remedies` / `/hole-remedies/{id}` | 整改结果列表 / 冻结详情 |
+| POST | `/hole-remedies/{id}/select` | 采纳候选并冻结为新版本（输入孔系、匹配关系、种子固化，只能采纳一次） |
 
 ## 典型流程
 
@@ -563,6 +569,76 @@ curl -s -X POST localhost:8000/process-solutions/1/select \
   组合数受 `20 000` 上限保护，超限 422。
 * 选定结果**冻结**设计链快照、工序路线、传递矩阵与随机种子；每个反算结果
   只能选定一次（重复选定/改选 422），历史方案不被来源更新改写。
+
+## 孔系装配分析（孔 / 销 / 螺栓与基准框架）
+
+以**一对零件**上的孔、销或螺栓及其基准框架为一个独立版本对象
+（`POST /hole-patterns`，示例 `examples/hole_pattern.json`）。长度单位复用
+全局 `LengthUnit`（内部统一 mm），直径 / 位置偏差复用 normal / uniform /
+triangular 分布模型，蒙特卡洛用固定种子 `SeedSequence` 子流（同种子同样本
+精确复现）。
+
+### 匹配位与基准框架
+
+每个 `mates[]` 匹配位给出两侧要素与连接件：
+
+* `feature_a` / `feature_b`：`kind=hole|pin`，名义中心 `(x,y)`、名义直径
+  与上下偏差、位置度公差带直径 `position_tolerance`、实体条件
+  `material_condition=MMC|LMC|RFS`、分布与 σ，以及位置度基准引用
+  `position_datum_refs`；
+* 两侧都是孔时必须给 `bolt_diameter_upper/lower`（**浮动螺栓**穿过两孔）；
+  只给螺栓极限、省略 `feature_b` 表示固定螺栓；孔 + 销为**固定连接件**。
+* 两侧基准框架 `frame_a/frame_b`：有序基准 `datums[]`，每个基准
+  `kind=size|edge`、约束的 2D 自由度 `constrains`（tx/ty/rz）、实体条件；
+  尺寸基准给直径极限（约束 rz 时还要 `lever_radius` 力臂），边线基准给
+  单位法向（约束 rz 时给角度公差）。空框架表示该侧不建立基准约束。
+
+创建期校验（指出对象、422 拒绝、不落库）：匹配位 id 重复 / B 侧缺失 /
+双外要素 / 双孔无螺栓 / 固定螺栓与销混用；直径或螺栓极限倒置（lower>upper）；
+normal 未给 σ；基准次序非从 1 连续、自由度重复或未覆盖 tx/ty/rz（基准退化）、
+两条平移边线法向平行；位置度引用不存在的基准或非优先次序连续前缀（跳级）。
+
+### 最坏边界与蒙特卡洛
+
+系统合并尺寸偏差、**实体状态补偿公差（bonus）**与**基准偏移（datum
+shift）**：
+
+* 固定连接件 VC 径向允许错位 `a = (D孔,min − d销,max)/2 − (t_A+t_B)/2`；
+  浮动螺栓 `a = (D_A,min+D_B,min)/2 − d螺栓,max − (t_A+t_B)/2`；
+* 最坏边界取 VC 边界尺寸（bonus=0、基准偏移=0），在转角网格上求圆盘族
+  `|R(θ)·pB+t−pA| ≤ a` 的公共交集（凸问题的确定性子梯度）；
+* MC 逐要素按分布抽样直径与两轴位置：实际孔径偏离 MMC/LMC 边界产生 bonus，
+  MMC/LMC 尺寸基准的实际间隙按位置度引用计入有效位置度，rz 基准经
+  间隙/(2·力臂) 或边线角度公差给模式转角；再向量化求解每个样本的最优位姿。
+
+返回：`worst_case`（是否可行、最优平移 `tx/ty` 与转角、可行转角范围、
+±x/±y 平移余量、名义位姿下**最先干涉的匹配位**、最优位姿下的限制匹配位、
+逐匹配位名义间隙/尺寸偏差/位置度/基准角度的**余量贡献分解**）与
+`monte_carlo`（装配成功率 / 失败概率、可行样本的 `tx/ty/θ` 均值·标准差·
+5/95 分位·最小最大即可行位姿范围、各匹配位干涉频率与失败样本中的
+**最先干涉计数占比**）。
+
+```bash
+curl -s -X POST localhost:8000/hole-patterns \
+  -H 'Content-Type: application/json' \
+  -d @examples/hole_pattern.json | jq '.result.worst_case.feasible,
+      .result.monte_carlo.assembly_success_rate'
+```
+
+### 版本、整改搜索与采纳冻结
+
+* `POST /hole-patterns/{id}/versions` 另建独立版本（完整新定义随版本冻结，
+  历史版本不回改）；`GET /hole-versions/{vid}` 多次读取内容不变。
+* `POST /hole-versions/{vid}/remedies`（示例 `examples/hole_remedy.json`）：
+  从候选钻孔尺寸 `drill_options`（必须放大孔径）、连接件规格
+  `fastener_options`、允许孔位修正 `correction_options` 枚举组合；
+  `locked_mates` 锁定孔位（禁修正）、`locked_fasteners` 锁定连接件
+  （禁换规格）。候选必须引用存在的匹配位且只对孔要素钻孔，锁与候选冲突
+  一律 422。所有候选共用同种子同源样本，零改动现状方案始终参与复核，
+  按 **失败概率（固定种子 MC）→ 最大孔位改动 → 孔径放大总量** 升序排列。
+* `POST /hole-remedies/{id}/select` 采纳某个 `rank`：把放大孔径 / 螺栓
+  规格写入并创建新版本，**冻结输入孔系、匹配关系与随机种子**；每个整改
+  结果只能采纳一次（重复采纳 422），历史版本不改写。
 
 ## 校验拒绝（HTTP 422）
 

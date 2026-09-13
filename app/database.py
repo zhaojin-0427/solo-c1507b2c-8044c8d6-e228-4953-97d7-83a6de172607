@@ -279,6 +279,67 @@ class NetworkScenarioRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+class ProcessPlanRow(Base):
+    """工序尺寸方案（版本线）：一次零件加工路线独立成版，首版创建时建行。"""
+
+    __tablename__ = "process_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    # 首版引用的冻结基线链（只读快照；无则 None）
+    source_chain_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class ProcessPlanVersionRow(Base):
+    """工序方案版本：设计链快照/工序路线/传递矩阵/种子随版本冻结，不回改。"""
+
+    __tablename__ = "process_plan_versions"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "version_no",
+                         name="uq_process_plan_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    plan_id: Mapped[int] = mapped_column(
+        ForeignKey("process_plans.id", ondelete="CASCADE"), index=True
+    )
+    version_no: Mapped[int] = mapped_column(Integer)
+    parent_version_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True)
+    name: Mapped[str] = mapped_column(String(200))
+    note: Mapped[str] = mapped_column(Text, default="")
+    request_json: Mapped[dict] = mapped_column(JSON)
+    snapshot_json: Mapped[dict] = mapped_column(JSON)
+    mc_samples: Mapped[int] = mapped_column(Integer)
+    random_seed: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class ProcessSolutionRow(Base):
+    """反算结果：锁定/档位/步进候选随请求冻结；选定后冻结选中候选。"""
+
+    __tablename__ = "process_solutions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    plan_id: Mapped[int] = mapped_column(
+        ForeignKey("process_plans.id", ondelete="CASCADE"), index=True
+    )
+    version_id: Mapped[int] = mapped_column(
+        ForeignKey("process_plan_versions.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    request_json: Mapped[dict] = mapped_column(JSON)
+    result_json: Mapped[dict] = mapped_column(JSON)
+    selected_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    selected_note: Mapped[str] = mapped_column(Text, default="")
+    frozen: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 _engine: Any = None
 
 
@@ -881,3 +942,155 @@ def list_network_scenarios(version_id: int) -> list[dict]:
             }
             for r in rows
         ]
+
+
+# ------------------------------------------------------- 工序尺寸方案 CRUD
+
+def save_process_plan_first_version(name: str, note: str,
+                                    source_chain_id: int | None,
+                                    request: dict, snapshot: dict,
+                                    mc_samples: int, seed: int) -> tuple[int, int]:
+    """事务性创建工序方案行与版本 1，返回 (plan_id, version_id)。"""
+    with session_factory() as s:
+        plan = ProcessPlanRow(name=name, note=note,
+                              source_chain_id=source_chain_id)
+        s.add(plan)
+        s.flush()
+        version = ProcessPlanVersionRow(
+            plan_id=plan.id, version_no=1, parent_version_id=None,
+            name=name, note=note, request_json=request,
+            snapshot_json=snapshot, mc_samples=mc_samples, random_seed=seed)
+        s.add(version)
+        s.commit()
+        return plan.id, version.id
+
+
+def save_process_plan_version(plan_id: int, version_no: int,
+                              parent_version_id: int | None, name: str,
+                              note: str, request: dict, snapshot: dict,
+                              mc_samples: int, seed: int) -> int:
+    with session_factory() as s:
+        version = ProcessPlanVersionRow(
+            plan_id=plan_id, version_no=version_no,
+            parent_version_id=parent_version_id, name=name, note=note,
+            request_json=request, snapshot_json=snapshot,
+            mc_samples=mc_samples, random_seed=seed)
+        s.add(version)
+        s.commit()
+        return version.id
+
+
+def get_process_plan(plan_id: int) -> ProcessPlanRow | None:
+    with session_factory() as s:
+        row = s.get(ProcessPlanRow, plan_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_process_plans() -> list[dict]:
+    with session_factory() as s:
+        plans = s.scalars(
+            select(ProcessPlanRow).order_by(ProcessPlanRow.id)).all()
+        out = []
+        for p in plans:
+            versions = s.scalars(
+                select(ProcessPlanVersionRow)
+                .where(ProcessPlanVersionRow.plan_id == p.id)
+                .order_by(ProcessPlanVersionRow.version_no)
+            ).all()
+            out.append({
+                "plan_id": p.id,
+                "name": p.name,
+                "note": p.note,
+                "source_chain_id": p.source_chain_id,
+                "created_at": p.created_at.isoformat(),
+                "versions": [
+                    {
+                        "version_id": v.id,
+                        "version_no": v.version_no,
+                        "parent_version_id": v.parent_version_id,
+                        "note": v.note,
+                        "operations": len(v.snapshot_json["edges"]),
+                        "closures": len(v.snapshot_json["closures"]),
+                        "mc_samples": v.mc_samples,
+                        "random_seed": v.random_seed,
+                        "created_at": v.created_at.isoformat(),
+                    }
+                    for v in versions
+                ],
+            })
+        return out
+
+
+def get_process_plan_version(version_id: int) -> ProcessPlanVersionRow | None:
+    with session_factory() as s:
+        row = s.get(ProcessPlanVersionRow, version_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_process_plan_versions(plan_id: int) -> list[ProcessPlanVersionRow]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(ProcessPlanVersionRow)
+            .where(ProcessPlanVersionRow.plan_id == plan_id)
+            .order_by(ProcessPlanVersionRow.version_no)
+        ).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def save_process_solution(plan_id: int, version_id: int, name: str, note: str,
+                          request: dict, result: dict) -> int:
+    with session_factory() as s:
+        row = ProcessSolutionRow(
+            plan_id=plan_id, version_id=version_id, name=name, note=note,
+            request_json=request, result_json=result, frozen=0)
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def get_process_solution(solution_id: int) -> ProcessSolutionRow | None:
+    with session_factory() as s:
+        row = s.get(ProcessSolutionRow, solution_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_process_solutions(version_id: int) -> list[dict]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(ProcessSolutionRow)
+            .where(ProcessSolutionRow.version_id == version_id)
+            .order_by(ProcessSolutionRow.id)
+        ).all()
+        return [
+            {
+                "solution_id": r.id,
+                "plan_id": r.plan_id,
+                "version_id": r.version_id,
+                "name": r.name,
+                "note": r.note,
+                "frozen": bool(r.frozen),
+                "selected_rank": r.selected_rank,
+                "candidate_count": len(r.result_json.get("candidates", [])),
+                "status": r.result_json.get("status"),
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+def freeze_process_solution(solution_id: int, rank: int, note: str) -> None:
+    """幂等选定：写入 selected_rank 并置 frozen=1（调用方保证只选一次）。"""
+    with session_factory() as s:
+        row = s.get(ProcessSolutionRow, solution_id)
+        row.selected_rank = rank
+        row.selected_note = note
+        row.frozen = 1
+        s.commit()

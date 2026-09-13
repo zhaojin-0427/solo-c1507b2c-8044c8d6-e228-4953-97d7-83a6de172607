@@ -28,6 +28,20 @@ from .network import (
     normalize_network,
     search_network_scenarios,
 )
+from .process_plan import (
+    ProcessPlanError,
+    SolveRequest as ProcessSolveSpec,
+    build_plan,
+    plan_from_snapshot,
+    plan_snapshot,
+    solve_plan,
+)
+from .process_schemas import (
+    ProcessPlanCreate,
+    ProcessPlanVersionCreate,
+    ProcessSelectRequest,
+    ProcessSolveRequest,
+)
 from .engine import (
     _override_chain,
     closure_samples,
@@ -1396,3 +1410,348 @@ def get_network_scenario(scenario_id: int) -> dict:
         raise HTTPException(status_code=404,
                             detail=f"网络方案 {scenario_id} 不存在")
     return _network_scenario_payload(row)
+
+
+# -------------------------------------------------------- 工序尺寸方案
+
+def _design_dims_from_chain(chain_row) -> list[dict]:
+    """从冻结基线链导入设计尺寸（规范化 mm 快照；只读，不改写基线）。"""
+    dims = []
+    for d in chain_row.result_json["normalized_inputs"]:
+        nm = d["normalized_mm"]
+        dims.append({
+            "id": d["dimension_id"],
+            "start": d["edge"][0],
+            "end": d["edge"][1],
+            "nominal": nm["nominal"],
+            "upper_deviation": nm["upper_deviation"],
+            "lower_deviation": nm["lower_deviation"],
+            "unit": "mm",
+            "sign": int(d["sign"]),
+            "source": "chain",
+            "note": f"导入自基线链 {chain_row.id}（{chain_row.name}）",
+        })
+    return dims
+
+
+def _design_dims_inline(payload) -> list[dict]:
+    dims = []
+    for d in payload.design_dimensions:
+        u = d.unit.value
+        dims.append({
+            "id": d.id,
+            "start": d.start_surface,
+            "end": d.end_surface,
+            "nominal": to_mm(d.nominal, u),
+            "upper_deviation": to_mm(d.upper_deviation, u),
+            "lower_deviation": to_mm(d.lower_deviation, u),
+            "unit": u,
+            "sign": int(d.sign),
+            "source": "inline",
+            "note": d.note,
+        })
+    return dims
+
+
+def _resolve_process_design(payload):
+    """返回 (design_dims_mm, source_record, source_chain_id)。"""
+    if payload.source_chain_id is not None:
+        chain_row = db.get_chain(payload.source_chain_id)
+        if chain_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"来源基线链 {payload.source_chain_id} 不存在")
+        dims = _design_dims_from_chain(chain_row)
+        source = {
+            "type": "chain",
+            "chain_id": chain_row.id,
+            "chain_name": chain_row.name,
+            "snapshot_policy": "设计尺寸随工序方案版本冻结；基线链后续更新"
+                               "不改写历史方案",
+            "imported_dimension_ids": [d["id"] for d in dims],
+        }
+        return dims, source, chain_row.id
+    dims = _design_dims_inline(payload)
+    source = {"type": "inline",
+              "dimension_ids": [d["id"] for d in dims]}
+    return dims, source, None
+
+
+def _build_process_version(payload, name: str, note: str, seed: int):
+    """校验 → 构建 → 快照，返回 (plan, snapshot, request_store, source, chain_id)。"""
+    # Pydantic 已做字段级校验；结构校验在 build_plan 中完成
+    design_dims, source, chain_id = _resolve_process_design(payload)
+    try:
+        plan = build_plan(payload, design_dims)
+    except ProcessPlanError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    snapshot = plan_snapshot(plan, source)
+    request_store = {
+        **payload.model_dump(mode="json"),
+        "random_seed": seed,
+        "mc_samples": payload.mc_samples,
+    }
+    return plan, snapshot, request_store, source, chain_id
+
+
+def _process_version_payload(plan_row, version_row) -> dict:
+    return {
+        "plan_id": plan_row.id,
+        "plan_name": plan_row.name,
+        "plan_note": plan_row.note,
+        "version_id": version_row.id,
+        "version_no": version_row.version_no,
+        "parent_version_id": version_row.parent_version_id,
+        "name": version_row.name,
+        "note": version_row.note,
+        "frozen": True,
+        "created_at": version_row.created_at.isoformat(),
+        "mc_samples": version_row.mc_samples,
+        "random_seed": version_row.random_seed,
+        "source": version_row.snapshot_json["source"],
+        "submitted_input": version_row.request_json,
+        "snapshot": version_row.snapshot_json,
+        "transfer_matrix": version_row.snapshot_json["transfer_matrix"],
+    }
+
+
+@app.post("/process-plans", status_code=201, tags=["process-plans"])
+def create_process_plan(payload: ProcessPlanCreate) -> dict:
+    """创建工序尺寸方案（一次零件加工路线独立成版，版本 1）。
+
+    依次记录毛坯面、每道工序的定位基准/被加工面与工序尺寸名义值、公差、
+    分布与制造成本；引用不可变设计尺寸链（冻结基线链只读导入或直接提交）。
+    系统按有向表面关系生成工序尺寸到设计闭环的传递矩阵。工序引用尚未形成
+    的表面、基准路径断开、重复约束、传递矩阵秩不足（工序自由度不受设计链
+    约束）一律拒绝（422）并指出相关工序与自由度。版本快照（设计链/路线/
+    矩阵/种子）写入 SQLite，来源更新不改写历史方案。
+    """
+    plan, snapshot, request_store, _, _ = _build_process_version(
+        payload, payload.name, payload.note, payload.random_seed)
+    plan_id, version_id = db.save_process_plan_first_version(
+        payload.name, payload.note, payload.source_chain_id,
+        request_store, snapshot, payload.mc_samples, payload.random_seed)
+    plan_row = db.get_process_plan(plan_id)
+    version_row = db.get_process_plan_version(version_id)
+    return _process_version_payload(plan_row, version_row)
+
+
+@app.get("/process-plans", tags=["process-plans"])
+def list_process_plans() -> dict:
+    return {"process_plans": db.list_process_plans()}
+
+
+def _load_process_plan(plan_id: int):
+    row = db.get_process_plan(plan_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"工序尺寸方案 {plan_id} 不存在")
+    return row
+
+
+@app.get("/process-plans/{plan_id}", tags=["process-plans"])
+def get_process_plan(plan_id: int) -> dict:
+    row = _load_process_plan(plan_id)
+    versions = db.list_process_plan_versions(plan_id)
+    return {
+        "plan_id": row.id,
+        "name": row.name,
+        "note": row.note,
+        "source_chain_id": row.source_chain_id,
+        "created_at": row.created_at.isoformat(),
+        "versions": [
+            {
+                "version_id": v.id,
+                "version_no": v.version_no,
+                "parent_version_id": v.parent_version_id,
+                "name": v.name,
+                "note": v.note,
+                "mc_samples": v.mc_samples,
+                "random_seed": v.random_seed,
+                "operations": len(v.snapshot_json["edges"]),
+                "closures": len(v.snapshot_json["closures"]),
+                "created_at": v.created_at.isoformat(),
+            }
+            for v in versions
+        ],
+    }
+
+
+@app.post("/process-plans/{plan_id}/versions", status_code=201,
+          tags=["process-plans"])
+def create_process_plan_version(plan_id: int,
+                                payload: ProcessPlanVersionCreate) -> dict:
+    """在同一方案下另建独立版本（完整新加工路线随版本冻结，历史不回改）。
+
+    parent_version_id 仅记血缘（缺省取最新版本）；来源基线链只读快照。
+    """
+    plan_row = _load_process_plan(plan_id)
+    versions = db.list_process_plan_versions(plan_id)
+    parent_id = versions[-1].id if versions else None
+    seed = (payload.random_seed if payload.random_seed is not None
+            else versions[-1].random_seed if versions else 20260913)
+    payload_with_seed = payload.model_copy(update={"random_seed": seed})
+    _, snapshot, request_store, _, chain_id = _build_process_version(
+        payload_with_seed, payload.name or plan_row.name, payload.note, seed)
+    new_no = max((v.version_no for v in versions), default=0) + 1
+    version_id = db.save_process_plan_version(
+        plan_id, new_no, parent_id, payload.name or plan_row.name,
+        payload.note, request_store, snapshot, payload.mc_samples, seed)
+    return _process_version_payload(plan_row,
+                                    db.get_process_plan_version(version_id))
+
+
+def _load_process_version(version_id: int):
+    row = db.get_process_plan_version(version_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"工序方案版本 {version_id} 不存在")
+    return row
+
+
+@app.get("/process-plan-versions/{version_id}", tags=["process-plans"])
+def get_process_plan_version(version_id: int) -> dict:
+    """读取冻结工序方案版本：快照/传递矩阵创建时固化，重复读取不变。"""
+    version_row = _load_process_version(version_id)
+    plan_row = _load_process_plan(version_row.plan_id)
+    return _process_version_payload(plan_row, version_row)
+
+
+def _solve_spec_from_request(plan, payload: ProcessSolveRequest,
+                             seed: int) -> ProcessSolveSpec:
+    grades = {t.id: float(t.grade_factor)
+              for t in payload.capability_tiers}
+    grade_costs = {t.id: float(t.setup_cost)
+                   for t in payload.capability_tiers}
+    locked = {item.edge_id: item.nominal
+              for item in payload.locked_dimensions}
+    edge_ids = {e.id for e in plan.edges}
+    unknown = sorted(set(locked) - edge_ids)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"锁定尺寸不在方案中: {unknown}；方案边: {plan.ids}")
+    step_refs = set(payload.edge_step_sizes) | set(payload.edge_grades) \
+        | set(payload.edge_grade_options)
+    bad_steps = sorted(step_refs - edge_ids)
+    if bad_steps:
+        raise HTTPException(
+            status_code=422,
+            detail=f"步进/档位限定引用了方案外工序: {bad_steps}")
+    return ProcessSolveSpec(
+        locked=locked, grades=grades, grade_costs=grade_costs,
+        default_grade=payload.default_grade or next(iter(grades)),
+        edge_grades=dict(payload.edge_grades),
+        edge_grade_list={k: list(v) for k, v in
+                         payload.edge_grade_options.items()},
+        step_sizes=[float(v) for v in payload.standard_step_sizes],
+        edge_steps={k: float(v) for k, v in payload.edge_step_sizes.items()},
+        mc_samples=payload.mc_samples, seed=seed,
+        max_candidates=payload.max_candidates)
+
+
+@app.post("/process-plan-versions/{version_id}/solve", status_code=201,
+          tags=["process-plans"])
+def solve_process_version(version_id: int,
+                          payload: ProcessSolveRequest) -> dict:
+    """锁定已定工序尺寸、反算其余名义，传播 WC/RSS/固定种子 MC 并枚举多解。
+
+    返回名义值范围（两段单纯形 LP）、逐项代数消元过程、各闭环误差贡献，
+    以及按「设计闭环达标数 → 最差余量 → 尺寸改动量 → 制造成本」排序的
+    档位×步进候选。锁定后自由度仍欠约束（名义无界）时拒绝（422）并指出
+    相关工序与自由度。结果随请求冻结，来源更新不改写。
+    """
+    version_row = _load_process_version(version_id)
+    plan = plan_from_snapshot(version_row.snapshot_json)
+    seed = (payload.random_seed if payload.random_seed is not None
+            else version_row.random_seed)
+    spec = _solve_spec_from_request(plan, payload, seed)
+    try:
+        result = solve_plan(plan, spec)
+    except ProcessPlanError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    result["frozen_inputs"] = {
+        "version_id": version_id,
+        "plan_id": version_row.plan_id,
+        "design_chain_snapshot": version_row.snapshot_json["design_chain_snapshot"],
+        "route_snapshot": "工序路线与传递矩阵引用冻结版本快照",
+        "random_seed": seed,
+        "mc_samples": payload.mc_samples,
+    }
+    solution_id = db.save_process_solution(
+        version_row.plan_id, version_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), result)
+    saved = db.get_process_solution(solution_id)
+    return _process_solution_payload(saved)
+
+
+@app.get("/process-plan-versions/{version_id}/solutions", tags=["process-plans"])
+def list_process_solutions(version_id: int) -> dict:
+    _load_process_version(version_id)
+    return {"version_id": version_id,
+            "solutions": db.list_process_solutions(version_id)}
+
+
+def _process_solution_payload(row) -> dict:
+    return {
+        "solution_id": row.id,
+        "plan_id": row.plan_id,
+        "version_id": row.version_id,
+        "name": row.name,
+        "note": row.note,
+        "frozen": bool(row.frozen),
+        "selected_rank": row.selected_rank,
+        "selected_note": row.selected_note,
+        "created_at": row.created_at.isoformat(),
+        "submitted_input": row.request_json,
+        "result": row.result_json,
+    }
+
+
+@app.get("/process-solutions/{solution_id}", tags=["process-plans"])
+def get_process_solution(solution_id: int) -> dict:
+    """读取冻结的反算结果（选定前可重看候选；选定后结果不可改）。"""
+    row = db.get_process_solution(solution_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"反算结果 {solution_id} 不存在")
+    return _process_solution_payload(row)
+
+
+@app.post("/process-solutions/{solution_id}/select", tags=["process-plans"])
+def select_process_candidate(solution_id: int,
+                             payload: ProcessSelectRequest) -> dict:
+    """选定一个候选并冻结：固化设计链快照、工序路线、传递矩阵与随机种子。
+
+    每个反算结果只能选定一次（重复选定或改选返回 422）；历史方案不改写。
+    """
+    row = db.get_process_solution(solution_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"反算结果 {solution_id} 不存在")
+    if row.frozen:
+        raise HTTPException(
+            status_code=422,
+            detail=f"反算结果 {solution_id} 已选定候选 rank="
+                   f"{row.selected_rank} 并冻结，不能改选；请在冻结版本上"
+                   "另建反算结果或新版本")
+    candidates = row.result_json.get("candidates", [])
+    if not candidates:
+        raise HTTPException(
+            status_code=422,
+            detail=f"反算结果 {solution_id} 无可行候选（status="
+                   f"{row.result_json.get('status')}），无法选定")
+    if payload.rank > len(candidates):
+        raise HTTPException(
+            status_code=422,
+            detail=f"rank={payload.rank} 超出候选数 {len(candidates)}")
+    db.freeze_process_solution(solution_id, payload.rank, payload.note)
+    saved = db.get_process_solution(solution_id)
+    answer = _process_solution_payload(saved)
+    chosen = next(c for c in saved.result_json["candidates"]
+                  if c["rank"] == payload.rank)
+    answer["selected_candidate"] = chosen
+    answer["freeze_note"] = (
+        "已冻结设计链快照、工序路线、传递矩阵与随机种子；来源链更新不"
+        "改写本方案。后续工序指导应引用本反算结果与版本快照。")
+    return answer

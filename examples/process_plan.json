@@ -1,0 +1,70 @@
+{
+  "name": "shaft-process-route",
+  "note": "轴套零件一次加工路线：毛坯面 B0 + 两道工序，内联设计尺寸 D1",
+  "origin_surface": "O",
+  "design_dimensions": [
+    {
+      "id": "D1",
+      "start_surface": "O",
+      "end_surface": "S2",
+      "nominal": 50.0,
+      "upper_deviation": 0.3,
+      "lower_deviation": -0.3,
+      "unit": "mm",
+      "note": "设计要求：端面 S2 相对图纸基准 O 的尺寸"
+    }
+  ],
+  "blank_dimensions": [
+    {
+      "id": "B1",
+      "start_surface": "O",
+      "end_surface": "B0",
+      "nominal": 60.0,
+      "upper_deviation": 0.5,
+      "lower_deviation": -0.5,
+      "unit": "mm",
+      "distribution": "uniform",
+      "manufacturing_cost": 0.0,
+      "note": "毛坯尺寸（毛坯面 B0）"
+    }
+  ],
+  "operations": [
+    {
+      "id": "OP1",
+      "datum_surface": "O",
+      "machined_surface": "S1",
+      "nominal": 30.0,
+      "upper_deviation": 0.1,
+      "lower_deviation": -0.1,
+      "unit": "mm",
+      "distribution": "uniform",
+      "manufacturing_cost": 10.0,
+      "note": "粗车 S1，以基准面 O 定位"
+    },
+    {
+      "id": "OP2",
+      "datum_surface": "S1",
+      "machined_surface": "S2",
+      "nominal": 20.0,
+      "upper_deviation": 0.1,
+      "lower_deviation": -0.1,
+      "unit": "mm",
+      "distribution": "uniform",
+      "manufacturing_cost": 12.0,
+      "note": "精车 S2，以 S1 定位"
+    }
+  ],
+  "stock_closures": [
+    {
+      "id": "ST1",
+      "blank_surface": "O",
+      "machined_surface": "S2",
+      "min_allowance": 8.0,
+      "unit": "mm",
+      "note": "S2 相对基准侧最小加工余量"
+    }
+  ],
+  "correlations": [],
+  "mc_samples": 100000,
+  "random_seed": 20260913
+}

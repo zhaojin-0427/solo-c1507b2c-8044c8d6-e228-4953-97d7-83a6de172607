@@ -1,0 +1,17 @@
+{
+  "name": "reverse-solve",
+  "note": "锁定部分工序，其余按能力档位×标准步进反算",
+  "locked_dimensions": [],
+  "capability_tiers": [
+    {"id": "fine", "grade_factor": 0.06, "setup_cost": 8.0},
+    {"id": "coarse", "grade_factor": 0.12, "setup_cost": 2.0}
+  ],
+  "default_grade": "coarse",
+  "edge_grades": {},
+  "edge_grade_options": {},
+  "standard_step_sizes": [1.0],
+  "edge_step_sizes": {},
+  "mc_samples": 50000,
+  "random_seed": 20260913,
+  "max_candidates": 10
+}

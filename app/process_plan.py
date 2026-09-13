@@ -354,15 +354,18 @@ def build_plan(req, design_dims: list[dict]) -> ProcessPlan:
             raise ProcessPlanError(
                 f"设计尺寸 {cid} 引用了方案中不存在的表面: {missing}；"
                 "设计闭环端面必须是毛坯面或某道工序的被加工面")
+        # 偏差字段兼容两种键：API 统一构造 *_deviation；快照重建可给 *_dev
+        es = dd.get("upper_deviation", dd.get("upper_dev"))
+        ei = dd.get("lower_deviation", dd.get("lower_dev"))
         coeff = {a: -float(sign), b: float(sign)}
         path = [{"surface_a": a, "surface_b": b, "sign": sign,
                  "edge": [a, b]}]
         closures.append(Closure(
             id=cid, kind="design", note=dd.get("note", ""),
-            lsl_mm=dd["nominal"] + dd["lower_dev"],
-            usl_mm=dd["nominal"] + dd["upper_dev"],
-            nominal=dd["nominal"], upper_dev=dd["upper_dev"],
-            lower_dev=dd["lower_dev"], surface_coeff=coeff, path=path))
+            lsl_mm=dd["nominal"] + ei,
+            usl_mm=dd["nominal"] + es,
+            nominal=dd["nominal"], upper_dev=es, lower_dev=ei,
+            surface_coeff=coeff, path=path))
 
     # ---- 余量闭环 ----
     for sc in req.stock_closures:
@@ -621,10 +624,12 @@ def linprog_bounds(n_vars, objective, a_ub, b_ub,
     ub = (np.full(n, np.inf) if upper_bounds is None
           else np.array(upper_bounds, float))
 
-    # 平移 x = z + lb（z ≥ 0）：一般约束 A z ≤ b − A·lb；有限上界 z ≤ ub−lb
+    # 平移 x = z + lb（z ≥ 0 由单纯形自然保证，不另加非负行，否则翻转后
+    # 产生系数为负的伪 ≥ 约束会破坏阶段 I）；一般约束 A z ≤ b − A·lb，
+    # 有限上界另加 z ≤ ub−lb。
     shift = lb.copy()
-    rows = [a_ub.reshape(-1, n), -np.eye(n)]
-    rhs = [(b_ub - a_ub.reshape(-1, n) @ shift).reshape(-1), np.zeros(n)]
+    rows = [a_ub.reshape(-1, n)]
+    rhs = [(b_ub - a_ub.reshape(-1, n) @ shift).reshape(-1)]
     finite = np.isfinite(ub - lb)
     if finite.any():
         rows.append(np.eye(n)[finite])
@@ -635,32 +640,32 @@ def linprog_bounds(n_vars, objective, a_ub, b_ub,
 
 
 def _simplex(c_vec, A_ub, b_ub, shift, tol=1e-9):
-    """通用两段单纯形表（Bland 规则）。约束 A_ub·z ≤ b_ub，z ≥ 0。
+    """标准两段单纯形表（Bland 规则）。约束 A_ub·z ≤ b_ub，z ≥ 0。
 
-    每行构造 松弛列 s_i 与人工列 a_i：b_i≥0 时松弛变量 +s_i 直接可行；
-    b_i<0 时整行规范化（乘 −1）后为 ≥ 约束，用 −s_i + a_i 构造，以人工
-    变量为基。阶段 I 极小化人工变量之和判可行性，阶段 II 转入真实目标。
-    表布局 [ 变量 n | 松弛 m | 人工 m | RHS ]。
+    对 b_i≥0 的 ≤ 约束引入非负松弛变量 s_i（初始基可行）；对 b_i<0 的
+    约束先乘 −1 化为 ≥ 约束，再引入剩余变量 s_i（系数 −1）与人工变量
+    a_i（系数 +1，初始基）。阶段 I 极小化 w=Σ a_i：目标行以
+    [0…0, 松弛/剩余, −1(人工), RHS=0] 初始化并对人工基行求和消去基列，
+    检验数 <0 即入基；w*>0 判不可行。阶段 II 换入真实目标行后继续。
+    表布局 [ 变量 n | 松弛/剩余 m | 人工 m | RHS ]。
     """
     m, n = A_ub.shape
     A_ub = A_ub.copy()
     b_ub = b_ub.copy()
+    flipped = b_ub < -tol                       # 翻转后为 ≥ 约束
+    A_ub[flipped] *= -1.0
+    b_ub[flipped] *= -1.0
+    artificial_rows = [i for i in range(m) if flipped[i]]
+
     width = n + 2 * m
     tab = np.zeros((m + 2, width + 1))
     tab[:m, :n] = A_ub
-    artificial_rows: list[int] = []
     basis = [-1] * m
     for i in range(m):
-        tab[i, n + i] = 1.0                       # 松弛列
-        tab[i, n + m + i] = 1.0                   # 人工列
-        if b_ub[i] >= -tol:
-            basis[i] = n + i                      # 松弛变量做基
-        else:
-            tab[i, :n] *= -1.0
-            tab[i, n + i] *= -1.0                 # ≥ 约束：−s_i + a_i = −b
-            basis[i] = n + m + i
-            artificial_rows.append(i)
-        tab[i, -1] = abs(b_ub[i])
+        tab[i, n + i] = -1.0 if flipped[i] else 1.0   # 剩余 / 松弛列
+        tab[i, n + m + i] = 1.0                        # 人工列
+        basis[i] = n + m + i if flipped[i] else n + i
+        tab[i, -1] = b_ub[i]
     phase1_row, phase2_row = m, m + 1
 
     def pivot(row, col, obj_rows):
@@ -670,110 +675,130 @@ def _simplex(c_vec, A_ub, b_ub, shift, tol=1e-9):
                 tab[i, :] -= tab[i, col] * tab[row, :]
         basis[row] = col
 
-    def enter(obj_row):
-        for j in range(n + m):                # Bland：下标最小的负检验数
+    def enter_any(obj_row, columns):
+        """Bland：下标最小的负检验数列（不要求存在正比值）。"""
+        for j in columns:
             if tab[obj_row, j] < -tol:
                 return j
         return None
 
-    all_rows = list(range(m + 2))
-    # ---- 阶段 I：目标 −Σ 人工列（对人工基行求和消零）。无人工行时
-    # 检验数恒为 0 立即结束；有人工行时把基从人工列换到结构列。 ----
-    tab[phase1_row, n + m:n + 2 * m] = -1.0
-    for i in artificial_rows:
-        tab[phase1_row, :] += tab[i, :]
-    while True:
-        col = enter(phase1_row)
-        if col is None:
-            break
+    def enter_feasible(obj_row, columns):
+        """阶段 I 用：跳过在所有约束行均无正系数（无可入主元）的列。"""
+        for j in columns:
+            if tab[obj_row, j] < -tol and any(
+                    tab[i, j] > tol for i in range(m)):
+                return j
+        return None
+
+    def ratio_test(col):
         ratios = [(tab[i, -1] / tab[i, col], i) for i in range(m)
                   if tab[i, col] > tol]
         if not ratios:
-            return None, None, "unbounded"
+            return None
         ratios.sort(key=lambda t: (t[0], basis[t[1]]))
-        pivot(ratios[0][1], col, all_rows)
-    if artificial_rows and tab[phase1_row, -1] > 1e-7:
-        return None, None, "infeasible"
-    # 人工变量仍在基（退化 0 值）：换出到任意非人工非零列
+        return ratios[0][1]
+
+    # 阶段 I 允许在所有非人工列（原变量 + 松弛 + 剩余）中选入基列：剩余变量
+    # （≥ 约束，列系数 −1）可在其余行为正，是把人工变量逐出基的必要桥梁；
+    # enter 已跳过在所有约束行无正系数（无可行比值）的列。
+    enter_columns = list(range(n + m))
+
+    # ---- 阶段 I：min w = Σ 人工变量。目标行初值 w−Σa=0（人工列 −1），
+    # 再**减去**各人工基行使基列归零：z 列检验数为负即入基、把人工变量
+    # 逐出行基；w*>0 判不可行。 ----
+    if artificial_rows:
+        tab[phase1_row, n + m:n + 2 * m] = -1.0
+        for i in artificial_rows:
+            tab[phase1_row, :] -= tab[i, :]
+        while True:
+            col = enter_feasible(phase1_row, enter_columns)
+            if col is None:
+                break
+            row = ratio_test(col)
+            if row is None:
+                return None, None, "unbounded"
+            pivot(row, col, list(range(m + 2)))
+        # 表中目标行为 −w：终止 RHS = −w*，w*>0（RHS<−tol）即不可行
+        if tab[phase1_row, -1] < -1e-7:
+            return None, None, "infeasible"
+    # 人工变量仍在基（退化 0 值）：换出到任意可行非人工列
     for i, bv in enumerate(basis):
         if bv >= n + m:
-            ncol = next((j for j in range(n + m)
+            ncol = next((j for j in enter_columns
                          if abs(tab[i, j]) > tol), None)
             if ncol is not None:
                 pivot(i, ncol, list(range(m)) + [phase2_row])
     assert all(bv < n + m for bv in basis), "阶段 I 后基仍含人工变量"
 
-    # ---- 阶段 II ----
+    # ---- 阶段 II：放入真实目标行并消去基列 ----
     cfull = np.zeros(n + 2 * m)
     cfull[:n] = c_vec
     tab[phase2_row, :width] = cfull
-    # 消去基列
+    tab[phase2_row, -1] = 0.0
     for i, bv in enumerate(basis):
         if bv < n + m and abs(tab[phase2_row, bv]) > tol:
             tab[phase2_row, :] -= tab[phase2_row, bv] * tab[i, :]
     while True:
-        col = enter(phase2_row)
+        col = enter_any(phase2_row, enter_columns)
         if col is None:
             break
-        ratios = [(tab[i, -1] / tab[i, col], i) for i in range(m)
-                  if tab[i, col] > tol]
-        if not ratios:
+        row = ratio_test(col)
+        if row is None:
+            # 负检验数列在所有约束行无正系数：目标可无限改进（无界）
             return None, None, "unbounded"
-        ratios.sort(key=lambda t: (t[0], basis[t[1]]))
-        pivot(ratios[0][1], col, list(range(m)) + [phase2_row])
+        pivot(row, col, list(range(m)) + [phase2_row])
 
     x = np.zeros(n)
     for i, bv in enumerate(basis):
         if bv < n:
             x[bv] = tab[i, -1]
     x += shift
-    val = -tab[phase2_row, -1] + float(np.asarray(cfull[:n]) @ shift)
+    val = -tab[phase2_row, -1] + float(np.asarray(c_vec[:n]) @ shift)
     return x, float(val), "optimal"
 
 
-def variable_ranges(p_design, lsl, usl, locked_mask, locked_values,
-                    free_idx, half_guards=None):
-    """对每个自由工序变量求满足设计闭环名义区间的名义范围。
+def variable_ranges(p_lower, p_upper, lo_lim, hi_lim, free_idx,
+                    fixed_values=None, fixed_const_lo=None,
+                    fixed_const_hi=None):
+    """对每个自由工序变量求名义可行范围。
+
+    闭环下界约束 ``P⁻·y_free + c_lo ≥ LSL``、上界约束
+    ``P⁺·y_free + c_hi ≤ USL``（``p_lower``/``p_upper`` 只取自由列；
+    固定边贡献由 ``fixed_const_lo/hi`` 给）。名义情形 P⁻=P⁺=P、
+    c_lo=c_hi=P·fixed。WC 护栏情形 P⁻/P⁺ 取逐边偏差方向（固定边可单边）。
 
     返回 {free_col: (lo, hi, bounded)}；整体不可行抛 ProcessPlanError。
-    half_guards 可给每闭环的预留半宽（名义上留出公差带，WC 可行用）。
     """
-    m = p_design.shape[0]
-    guards = np.zeros(m) if half_guards is None else np.asarray(half_guards)
+    p_lower = np.asarray(p_lower, dtype=float)
+    p_upper = np.asarray(p_upper, dtype=float)
     free_idx = list(free_idx)
-    n = p_design.shape[1]
-    # 固定列贡献
-    fixed = np.zeros(n)
-    fixed[locked_mask] = locked_values[locked_mask]
-    rhs_const = p_design @ fixed
-    pf = p_design[:, free_idx]
-    lo_lim = lsl + guards - rhs_const
-    hi_lim = usl - guards - rhs_const
-
     nf = len(free_idx)
-    A = np.vstack([-pf, pf])
-    b = np.concatenate([-lo_lim, hi_lim])
-    # 整体可行性：0 目标走一遍两阶段（负 RHS 约束由人工变量检测）
-    _, _, st = linprog_bounds(
-        nf, np.zeros(nf), A, b, lower_bounds=np.full(nf, 1e-9))
-    if st == "infeasible":
+    c_lo = (np.zeros(p_lower.shape[0]) if fixed_const_lo is None
+            else np.asarray(fixed_const_lo, dtype=float))
+    c_hi = (np.zeros(p_upper.shape[0]) if fixed_const_hi is None
+            else np.asarray(fixed_const_hi, dtype=float))
+    # -P⁻ z ≤ c_lo − LSL ；P⁺ z ≤ USL − c_hi
+    A = np.vstack([-p_lower, p_upper])
+    b = np.concatenate([c_lo - np.asarray(lo_lim, dtype=float),
+                        np.asarray(hi_lim, dtype=float) - c_hi])
+
+    def feasible():
+        _, _, st = linprog_bounds(
+            nf, np.zeros(nf), A, b, lower_bounds=np.full(nf, 1e-9))
+        return st != "infeasible"
+
+    if not feasible():
         raise ProcessPlanError(
-            "锁定的工序尺寸与设计闭环名义要求矛盾：不存在满足全部"
-            "设计闭环名义区间的反算解（请放宽锁定或调整设计尺寸）")
+            "锁定的工序尺寸与设计闭环要求矛盾：不存在满足全部设计闭环的"
+            "反算解（请放宽锁定 / 能力档位或调整设计尺寸）")
     out: dict[int, tuple] = {}
     for k, col in enumerate(free_idx):
-        c_lo = np.zeros(nf); c_lo[k] = 1.0
-        c_hi = np.zeros(nf); c_hi[k] = -1.0
+        c_lo_obj = np.zeros(nf); c_lo_obj[k] = 1.0
+        c_hi_obj = np.zeros(nf); c_hi_obj[k] = -1.0
         lo_x, _, st_lo = linprog_bounds(
-            nf, c_lo, A, b,
-            lower_bounds=np.full(nf, 1e-9), upper_bounds=None)
+            nf, c_lo_obj, A, b, lower_bounds=np.full(nf, 1e-9))
         hi_x, _, st_hi = linprog_bounds(
-            nf, c_hi, A, b,
-            lower_bounds=np.full(nf, 1e-9), upper_bounds=None)
-        if st_lo == "infeasible" or st_hi == "infeasible":
-            raise ProcessPlanError(
-                "锁定的工序尺寸与设计闭环名义要求矛盾：不存在满足全部"
-                "设计闭环名义区间的反算解（请放宽锁定或调整设计尺寸）")
+            nf, c_hi_obj, A, b, lower_bounds=np.full(nf, 1e-9))
         unbounded = (st_lo == "unbounded" or st_hi == "unbounded")
         lo_v = -np.inf if st_lo == "unbounded" else float(lo_x[k])
         hi_v = np.inf if st_hi == "unbounded" else float(hi_x[k])
@@ -787,17 +812,22 @@ def elimination_trace(p_design: np.ndarray,
                       targets_mid: np.ndarray,
                       edge_ids: list[str],
                       locked_mask: np.ndarray,
-                      closure_ids: list[str]) -> dict:
+                      closure_ids: list[str],
+                      op_mask: np.ndarray | None = None) -> dict:
     """对设计闭环名义方程 P·y = t 做高斯-若尔当消元（自由列优先主元）。
 
     返回 pivot/free 变量划分、逐步消元记录与把 pivot 变量表为自由变量
     仿射函数的代数表达式。目标取设计尺寸带中点 N+(ES+EI)/2（名义反算的
-    居中解）；锁定列视为已知常数。
+    居中解）；锁定列与毛坯尺寸列（op_mask=False）视为已知常数。
     """
     m, n = p_design.shape
-    # 消元列序：自由（待反算）优先，其次锁定列，保证主元尽量落在待求量上
-    col_order = [j for j in range(n) if not locked_mask[j]] + \
-                [j for j in range(n) if locked_mask[j]]
+    if op_mask is None:
+        op_mask = np.ones(n, dtype=bool)
+    # 已知量（不可反算）：锁定工序尺寸 + 全部毛坯尺寸
+    fixed_known = locked_mask | (~op_mask)
+    # 消元列序：自由（待反算工序）优先，其次已知列，保证主元落在待求量上
+    col_order = [j for j in range(n) if not fixed_known[j]] + \
+                [j for j in range(n) if fixed_known[j]]
     a = np.array(p_design, dtype=float)
     b = np.array(targets_mid, dtype=float)
     pivots: list[tuple[int, int]] = []
@@ -831,7 +861,8 @@ def elimination_trace(p_design: np.ndarray,
             "closure_row": r + 1,
             "closure_id": closure_ids[r],
             "pivot_edge": edge_ids[col],
-            "pivot_kind": "待反算" if not locked_mask[col] else "锁定",
+            "pivot_kind": ("待反算" if not fixed_known[col]
+                           else ("锁定" if locked_mask[col] else "毛坯已知")),
             "normalized_row": [round(float(v), 9) for v in a[r, :]],
             "rhs": round(float(b[r]), 9),
             "eliminated_rows": eliminated,
@@ -842,10 +873,10 @@ def elimination_trace(p_design: np.ndarray,
 
     pivot_cols = [c for _, c in pivots]
     free_cols = [j for j in range(n)
-                 if j not in pivot_cols and not locked_mask[j]]
-    fixed_cols = [j for j in range(n) if locked_mask[j]]
+                 if j not in pivot_cols and not fixed_known[j]]
+    fixed_cols = [j for j in range(n) if fixed_known[j]]
 
-    # pivot 边的仿射表达式：y_pivot = rhs − Σ(自由/固定系数)·y_j
+    # pivot 边的仿射表达式：y_pivot = rhs − Σ(自由/已知系数)·y_j
     expressions = []
     for rr, col in pivots:
         terms = []
@@ -855,11 +886,13 @@ def elimination_trace(p_design: np.ndarray,
                               "coefficient": round(float(-a[rr, j]), 9)})
         for j in fixed_cols:
             if abs(a[rr, j]) > 1e-9:
-                terms.append({"edge": edge_ids[j], "role": "锁定已知值",
+                role = "锁定已知值" if locked_mask[j] else "毛坯尺寸已知值"
+                terms.append({"edge": edge_ids[j], "role": role,
                               "coefficient": round(float(-a[rr, j]), 9)})
         expressions.append({
             "edge": edge_ids[col],
-            "role": "待反算" if not locked_mask[col] else "锁定主元",
+            "role": ("待反算" if not fixed_known[col]
+                     else ("锁定主元" if locked_mask[col] else "毛坯主元")),
             "expression": f"{edge_ids[col]} = {round(float(b[rr]), 6)}"
                           + "".join(
                               (f" {'+' if t['coefficient'] >= 0 else '-'} "
@@ -879,7 +912,9 @@ def elimination_trace(p_design: np.ndarray,
         "degrees_of_freedom": len(free_cols),
         "pivot_edges": [edge_ids[c] for c in pivot_cols],
         "free_edges": [edge_ids[j] for j in free_cols],
-        "locked_edges": [edge_ids[j] for j in fixed_cols],
+        "fixed_edges": [edge_ids[j] for j in fixed_cols],
+        "locked_edges": [edge_ids[j] for j in fixed_cols if locked_mask[j]],
+        "blank_edges": [edge_ids[j] for j in fixed_cols if not op_mask[j]],
         "steps": steps,
         "expressions": expressions,
         "dependent_closures": dependent,
@@ -909,11 +944,13 @@ def _chain_for(plan: ProcessPlan, nominals, mids, halfs, sigmas,
 
 def propagate(plan: ProcessPlan, nominals, halfs, sigmas, mids=None,
               explicit_flags=None, mc_samples: int | None = None,
-              seed: int | None = None, p_mat: np.ndarray | None = None) -> dict:
+              seed: int | None = None, p_mat: np.ndarray | None = None,
+              dev_lo=None, dev_hi=None) -> dict:
     """对全部闭环传播 WC / RSS / 固定种子 MC。
 
     nominals/halfs/sigmas 按 plan.edges 顺序（mm）；闭环样本 C = Y·Pᵀ，
-    每条边每轮只抽样一次，各闭环同源。
+    每条边每轮只抽样一次，各闭环同源。dev_lo/dev_hi 给逐边非对称偏差
+    （自由边 =∓half，锁定/毛坯边用提交 EI/ES）；缺省按 mid±half 对称。
     """
     n_e = len(plan.edges)
     nominals = np.asarray(nominals, dtype=float)
@@ -921,13 +958,22 @@ def propagate(plan: ProcessPlan, nominals, halfs, sigmas, mids=None,
     sigmas = np.asarray(sigmas, dtype=float)
     if mids is None:
         mids = np.array([e.mid for e in plan.edges])
+    mids = np.asarray(mids, dtype=float)
+    if dev_lo is None:
+        dev_lo = mids - halfs
+    if dev_hi is None:
+        dev_hi = mids + halfs
+    dev_lo = np.asarray(dev_lo, dtype=float)
+    dev_hi = np.asarray(dev_hi, dtype=float)
     if explicit_flags is None:
         explicit_flags = [e.sigma_explicit for e in plan.edges]
     p = plan.transfer_matrix() if p_mat is None else p_mat
-    mu = p @ (nominals + mids)
+    p_pos, p_neg = np.maximum(p, 0.0), np.minimum(p, 0.0)
     c0 = p @ nominals
-    band = np.abs(p) @ halfs
-    wc_lo, wc_hi = mu - band, mu + band
+    mu = p @ (nominals + mids)
+    wc_lo = p_pos @ (nominals + dev_lo) + p_neg @ (nominals + dev_hi)
+    wc_hi = p_pos @ (nominals + dev_hi) + p_neg @ (nominals + dev_lo)
+    band = (wc_hi - wc_lo) / 2.0
     cov_edge = plan.corr * (sigmas[:, None] * sigmas[None, :])
     closure_cov = p @ cov_edge @ p.T
     var_l = np.maximum(np.diag(closure_cov), 0.0)
@@ -945,19 +991,23 @@ def propagate(plan: ProcessPlan, nominals, halfs, sigmas, mids=None,
     for li, cl in enumerate(plan.closures):
         col = closure_samples[:, li]
         q005, q995 = np.quantile(col, [0.005, 0.995])
-        # WC 逐边公差贡献
+        # WC 逐边公差贡献（取该边上下偏差半宽）
         wc_contrib = []
         for j, e in enumerate(plan.edges):
             if abs(p[li, j]) > EPS:
+                edge_half = (dev_hi[j] - dev_lo[j]) / 2.0
                 wc_contrib.append({
                     "edge_id": e.id,
                     "operation_id": e.op_id,
                     "kind": e.kind,
                     "coefficient": float(p[li, j]),
-                    "half_width_mm": float(halfs[j]),
-                    "tolerance_contribution_mm": float(abs(p[li, j]) * halfs[j]),
+                    "lower_deviation_mm": float(dev_lo[j]),
+                    "upper_deviation_mm": float(dev_hi[j]),
+                    "half_width_mm": float(edge_half),
+                    "tolerance_contribution_mm": float(
+                        abs(p[li, j]) * edge_half),
                     "tolerance_share": (
-                        float(abs(p[li, j]) * halfs[j] / band[li])
+                        float(abs(p[li, j]) * edge_half / band[li])
                         if band[li] > EPS else 0.0),
                 })
         # RSS / MC 方差贡献（协方差法）
@@ -1130,8 +1180,14 @@ def solve_plan(plan: ProcessPlan, req: SolveRequest) -> dict:
     d_usl = np.array([usl[i] for i in design_rows])
 
     # ---- 名义可行范围（先不带公差护栏，得到理论范围） ----
-    ranges = variable_ranges(pd_, d_lsl, d_usl, locked_mask, locked_nom,
-                             free_idx)
+    # 非自由列（锁定工序 + 毛坯）名义作为已知常数，自由列位置填 0
+    fixed_nominal = nominal0.copy()
+    fixed_nominal[free_idx] = 0.0
+    pf_nom = pd_[:, free_idx]
+    fixed_const_nom = pd_ @ fixed_nominal
+    ranges = variable_ranges(
+        pf_nom, pf_nom, d_lsl, d_usl, free_idx,
+        fixed_const_lo=fixed_const_nom, fixed_const_hi=fixed_const_nom)
     unbounded = [(plan.edges[j].op_id, plan.edges[j].machined)
                  for j in free_idx if not ranges[j][2]]
     if unbounded:
@@ -1146,14 +1202,16 @@ def solve_plan(plan: ProcessPlan, req: SolveRequest) -> dict:
     # ---- 代数消元（名义方程，目标取带中点） ----
     trace = elimination_trace(
         pd_, d_mid, ids, locked_mask,
-        [plan.closures[i].id for i in design_rows])
+        [plan.closures[i].id for i in design_rows], op_mask=op_mask)
 
     # ---- 档位 × 步进 候选枚举 ----
     grade_options = _grade_options(plan, free_idx, req)
     grade_combos = _grade_combinations(grade_options)
     halfs0 = np.array([e.half_width for e in plan.edges])
     sigmas0 = np.array([e.sigma for e in plan.edges])
-    mids0 = np.zeros(n)  # 反算结果按对称偏差带（mid=0）提交
+    # 自由边按对称偏差带（mid=0）；锁定工序/毛坯边保留提交公差带中点
+    # （单边公差的带中点偏移按原值计入闭环均值）。
+    mids_fixed = np.array([e.mid for e in plan.edges])
 
     scored: list[dict] = []
     for gi, combo in enumerate(grade_combos):
@@ -1171,32 +1229,52 @@ def solve_plan(plan: ProcessPlan, req: SolveRequest) -> dict:
             grade_record[e.id] = {
                 "grade": gid, "factor": k_factor,
                 "half_width_mm_estimate": half_est}
-        # WC 护栏下的名义可行网格
+        # WC 护栏：固定边保留原始（可单边）偏差带，自由边以对称半宽预留。
+        # 下界约束用 P⁻（正系数取下偏差方向）、上界用 P⁺（正系数取上偏差）。
+        pf = pd_[:, free_idx]
+        fixed_lo = fixed_nominal.copy()
+        fixed_hi = fixed_nominal.copy()
+        for j in range(n):
+            if j not in free_idx:
+                fixed_lo[j] = nominal0[j] + plan.edges[j].lower_dev
+                fixed_hi[j] = nominal0[j] + plan.edges[j].upper_dev
+        c_lo = pd_ @ fixed_lo - np.abs(pf) @ halfs[free_idx]
+        c_hi = pd_ @ fixed_hi + np.abs(pf) @ halfs[free_idx]
         try:
             rng_guard = variable_ranges(
-                pd_, d_lsl, d_usl, locked_mask, locked_nom, free_idx,
-                half_guards=np.abs(pd_) @ halfs)
+                pf, pf, d_lsl, d_usl, free_idx,
+                fixed_const_lo=c_lo, fixed_const_hi=c_hi)
         except ProcessPlanError:
             continue
         grid = _nominal_grid(plan, free_idx, rng_guard, req, nominal0)
         if grid is None:
             continue
         for nominals in grid:
-            nom_full = locked_nom.copy()
+            nom_full = fixed_nominal.copy()
             # 用最终名义修正档位半宽（T=K·∛N）
             h_final = halfs.copy()
             s_final = sigmas.copy()
+            m_final = mids_fixed.copy()
+            d_lo = np.zeros(n)
+            d_hi = np.zeros(n)
             for j in free_idx:
                 h_final[j] = _grade_half(nominals[j], combo[j][1])
                 s_final[j] = engine._theoretical_sigma(
                     plan.edges[j].distribution, h_final[j])
+                m_final[j] = 0.0            # 自由边对称偏差带
+                d_lo[j], d_hi[j] = -h_final[j], h_final[j]
                 nom_full[j] = nominals[j]
-            # 提交值（锁定/毛坯）边保留原 half/sigma
+            # 提交值（锁定/毛坯）边保留原 mid/half/sigma
+            d_lo = m_final - h_final
+            d_hi = m_final + h_final
             for j in range(n):
                 if not op_mask[j] or locked_mask[j]:
                     h_final[j] = halfs0[j]
                     s_final[j] = sigmas0[j]
-            wc = _wc_check(p, nom_full, mids0, h_final, lsl, usl,
+                    m_final[j] = mids_fixed[j]
+                    d_lo[j] = plan.edges[j].lower_dev
+                    d_hi[j] = plan.edges[j].upper_dev
+            wc = _wc_check(p, nom_full, d_lo, d_hi, lsl, usl,
                            design_rows, stock_rows)
             if wc is None:
                 continue
@@ -1209,7 +1287,7 @@ def solve_plan(plan: ProcessPlan, req: SolveRequest) -> dict:
                 "combo": dict(combo),
                 "nominals": nom_full.copy(),
                 "halfs": h_final, "sigmas": s_final,
-                "mids": mids0, "flags": flags,
+                "mids": m_final, "flags": flags,
                 "grade_record": grade_record,
                 "manufacturing_cost": total_cost,
                 "change": change,
@@ -1230,6 +1308,13 @@ def solve_plan(plan: ProcessPlan, req: SolveRequest) -> dict:
             "candidates": [],
             "message": "给定能力档位与步进下没有满足全部闭环 WC 边界的组合；"
                        "名义可行范围已给出，可放宽档位公差或调整步进",
+            "enumeration": {
+                "grade_combinations": len(grade_combos),
+                "wc_feasible_states": 0,
+                "mc_verified": 0,
+                "limits": {"grade": MAX_GRADE_COMBINATIONS,
+                           "grid": MAX_NOMINAL_GRID_TOTAL},
+            },
         }
 
     # ---- 排序：设计闭环达标数 → 最差余量 → 改动量 → 成本 ----
@@ -1432,11 +1517,17 @@ def _nominal_grid(plan, free_idx, ranges, req, nominal0):
     return out
 
 
-def _wc_check(p, nominals, mids, halfs, lsl, usl, design_rows, stock_rows):
-    """极值法边界校核；任一设计闭环越界返回 None（候选被粗筛掉）。"""
-    mu = p @ (nominals + mids)
-    band = np.abs(p) @ halfs
-    lo, hi = mu - band, mu + band
+def _wc_check(p, nominals, dev_lo, dev_hi, lsl, usl,
+              design_rows, stock_rows):
+    """极值法边界校核（逐边非对称偏差）；任一设计闭环越界返回 None。
+
+    闭环最小值取 Σ P⁺·(N+EI) + P⁻·(N+ES)，最大值反之（P⁺=max(P,0)、
+    P⁻=min(P,0)）。自由边 EI=−T、ES=+T，锁定/毛坯边用提交偏差。
+    """
+    p_pos = np.maximum(p, 0.0)
+    p_neg = np.minimum(p, 0.0)
+    lo = p_pos @ (nominals + dev_lo) + p_neg @ (nominals + dev_hi)
+    hi = p_pos @ (nominals + dev_hi) + p_neg @ (nominals + dev_lo)
     n = p.shape[0]
     in_spec = np.zeros(n, dtype=bool)
     margin = np.zeros(n)

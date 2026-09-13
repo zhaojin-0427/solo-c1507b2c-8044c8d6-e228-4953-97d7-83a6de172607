@@ -1414,12 +1414,18 @@ def get_network_scenario(scenario_id: int) -> dict:
 
 # -------------------------------------------------------- 工序尺寸方案
 
-def _design_dims_from_chain(chain_row) -> list[dict]:
-    """从冻结基线链导入设计尺寸（规范化 mm 快照；只读，不改写基线）。"""
-    dims = []
+def _design_dims_from_chain(chain_row) -> tuple[list[dict], list[str]]:
+    """从冻结基线链导入独立设计尺寸（规范化 mm 快照；只读，不改写基线）。
+
+    基线链是单一闭合环：所有边都映射到方案表面时存在一个线性相关（封闭环
+    关系 Σ s_i·L_i = C0），导入时按行阶梯剔除一条可由其余尺寸线性表示的
+    边（通常是反向封闭边），只保留独立设计尺寸。
+    返回 (设计尺寸列表, 被剔除的闭环边 id)。
+    """
+    raw = []
     for d in chain_row.result_json["normalized_inputs"]:
         nm = d["normalized_mm"]
-        dims.append({
+        raw.append({
             "id": d["dimension_id"],
             "start": d["edge"][0],
             "end": d["edge"][1],
@@ -1431,7 +1437,33 @@ def _design_dims_from_chain(chain_row) -> list[dict]:
             "source": "chain",
             "note": f"导入自基线链 {chain_row.id}（{chain_row.name}）",
         })
-    return dims
+
+    all_surfaces = sorted({s for r_ in raw for s in (r_["start"], r_["end"])})
+    aidx = {s: i for i, s in enumerate(all_surfaces)}
+
+    def row_vec(r_):
+        v = np.zeros(len(all_surfaces))
+        v[aidx[r_["start"]]] = -r_["sign"]
+        v[aidx[r_["end"]]] = r_["sign"]
+        return v
+
+    chosen: list[dict] = []
+    bmat = np.zeros((0, len(all_surfaces)))
+    dropped: list[str] = []
+    for dd in raw:
+        vv = row_vec(dd)
+        rank_before = int(np.linalg.matrix_rank(bmat, tol=1e-8))
+        rank_after = int(np.linalg.matrix_rank(
+            np.vstack([bmat, vv]) if len(chosen) else vv[None, :], tol=1e-8))
+        if rank_after == rank_before:
+            dropped.append(dd["id"])
+            continue
+        chosen.append(dd)
+        bmat = np.vstack([bmat, vv]) if len(chosen) > 1 else vv[None, :]
+    if dropped:
+        for dd in chosen:
+            dd["note"] += f"；闭合环冗余边 {dropped} 已按线性相关剔除（封闭环）"
+    return chosen, dropped
 
 
 def _design_dims_inline(payload) -> list[dict]:
@@ -1461,7 +1493,7 @@ def _resolve_process_design(payload):
             raise HTTPException(
                 status_code=404,
                 detail=f"来源基线链 {payload.source_chain_id} 不存在")
-        dims = _design_dims_from_chain(chain_row)
+        dims, dropped = _design_dims_from_chain(chain_row)
         source = {
             "type": "chain",
             "chain_id": chain_row.id,
@@ -1469,6 +1501,7 @@ def _resolve_process_design(payload):
             "snapshot_policy": "设计尺寸随工序方案版本冻结；基线链后续更新"
                                "不改写历史方案",
             "imported_dimension_ids": [d["id"] for d in dims],
+            "dropped_closure_edges": dropped,
         }
         return dims, source, chain_row.id
     dims = _design_dims_inline(payload)

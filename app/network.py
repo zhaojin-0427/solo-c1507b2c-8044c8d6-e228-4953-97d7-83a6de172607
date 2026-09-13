@@ -683,10 +683,20 @@ def search_network_scenarios(net: NormalizedNetwork, request) -> dict:
     verified = []
     for item in mc_states:
         st = item["state"]
-        res = compute_network(
-            net, sigmas=item["sigmas"], mids=mids, halfs=item["halfs"],
-            explicit_flags=st["flags"],
-            n_samples=request.mc_samples, seed=seed)
+        is_base = bool(st.get("is_baseline"))
+        if is_base:
+            # 零成本现状候选必须与冻结网络版本结果完全一致：用网络自身的
+            # 种子/样本数复核（而非本次搜索请求的种子/样本数），否则稀有
+            # 尾部超差率会因抽样配置不同而与基线结果不一致。
+            res = compute_network(
+                net, sigmas=item["sigmas"], mids=mids, halfs=item["halfs"],
+                explicit_flags=st["flags"],
+                n_samples=net.mc_samples, seed=net.seed)
+        else:
+            res = compute_network(
+                net, sigmas=item["sigmas"], mids=mids, halfs=item["halfs"],
+                explicit_flags=st["flags"],
+                n_samples=request.mc_samples, seed=seed)
         joint_reject = res["joint"]["joint_reject_rate_monte_carlo"]
         verified.append({
             "item": item,
@@ -694,6 +704,9 @@ def search_network_scenarios(net: NormalizedNetwork, request) -> dict:
             "joint_pass": res["joint"]["joint_pass_rate_monte_carlo"],
             "loops": res["loops"],
             "all_pass": joint_reject <= request.target_reject_rate,
+            "monte_carlo": {"samples": (net.mc_samples if is_base
+                                        else request.mc_samples),
+                            "seed": (net.seed if is_base else seed)},
         })
 
     verified.sort(key=lambda v: (
@@ -764,11 +777,25 @@ def search_network_scenarios(net: NormalizedNetwork, request) -> dict:
             },
         }
 
-    candidates = [
-        _candidate(rank, v) for rank, v in enumerate(verified, start=1)
+    ordered = list(enumerate(verified, start=1))
+    ranked = [
+        _candidate(rank, v) for rank, v in ordered
     ]
-    baseline_v = next(v for v in verified
-                      if v["item"]["state"].get("is_baseline"))
+    # 零成本现状候选必须始终出现在候选列表中（即使排序后落在截断窗口外）：
+    # 否则调用方无法对比「不收紧」方案。先取前 max_candidates，缺失则补入
+    # 现状候选（标注其真实排序名次）。
+    cap = request.max_candidates
+    selected = ranked[:cap]
+    base_v = next(v for v in verified
+                  if v["item"]["state"].get("is_baseline"))
+    base_rank = next(rank for rank, v in ordered
+                     if v["item"]["state"].get("is_baseline"))
+    if not any(c["is_current_baseline"] for c in selected):
+        base_candidate = _candidate(base_rank, base_v)
+        base_candidate["included_beyond_limit"] = True
+        selected = selected + [base_candidate]
+    candidates = selected
+    baseline_v = base_v
     baseline = {
         "joint_reject_rate_monte_carlo": baseline_v["joint_reject"],
         "joint_pass_rate_monte_carlo": baseline_v["joint_pass"],
@@ -798,7 +825,7 @@ def search_network_scenarios(net: NormalizedNetwork, request) -> dict:
             "（scale_normal_sigma=true 时随公差带等比缩放）；std_dev_scale "
             "给定则未锁定尺寸 σ 统一再乘该系数并视为显式 σ；锁定尺寸不调整",
         "baseline": baseline,
-        "candidates": candidates[:request.max_candidates],
+        "candidates": candidates,
         "search": {
             "beam_width": beam_width,
             "states_after_dedup": len(states),

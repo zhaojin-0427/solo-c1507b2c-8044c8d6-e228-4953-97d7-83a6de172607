@@ -530,6 +530,28 @@ def test_scenario_search_ranking_and_lock(client):
         pytest.approx(base_reject)
 
 
+def test_scenario_search_baseline_kept_beyond_candidate_limit(client):
+    """零成本现状候选即使排在截断窗口之外也必须出现在候选列表中。"""
+    j = _failing_network(client)
+    vid = j["version_id"]
+    r = client.post(f"/network-versions/{vid}/scenarios", json={
+        "name": "tighten-limited",
+        "locked_dimensions": ["E"],
+        "scale_levels": [0.5, 0.7, 1.0],
+        "scale_normal_sigma": True,
+        "tightening_cost": {"A": 2.0},
+        "default_cost": 1.0,
+        "mc_samples": 20000,
+        "random_seed": 11,
+        "max_candidates": 1,
+    })
+    assert r.status_code == 201, r.text
+    cands = r.json()["result"]["candidates"]
+    base = [c for c in cands if c["is_current_baseline"]]
+    assert len(base) == 1 and base[0]["total_cost"] == 0.0
+    assert base[0]["included_beyond_limit"] is True
+
+
 def test_scenario_std_dev_policies(client):
     j = _failing_network(client)
     vid = j["version_id"]

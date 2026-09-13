@@ -2008,9 +2008,15 @@ def select_hole_remedy(remedy_id: int, payload: RemedySelectRequest) -> dict:
         parent_version.request_json)
     model = build_hole_model(parent_payload)
     adopted_name = f"{remedy_row.name}-采纳"
+    # 采纳版本与整改搜索同抽样规模 / 同种子，保证重算失败概率与候选一致
+    remedy_samples = int(remedy_row.result_json.get("samples")
+                         or parent_payload.mc_samples)
+    remedy_seed = int(remedy_row.result_json["random_seed"]) \
+        if remedy_row.result_json.get("random_seed") is not None \
+        else parent_payload.random_seed
     new_payload = freeze_payload(
         model, chosen, adopted_name, payload.note or remedy_row.note,
-        parent_payload)
+        parent_payload, mc_samples=remedy_samples, seed=remedy_seed)
     result = analyze_hole(new_payload)
     new_model = build_hole_model(new_payload)
     pattern_versions = db.list_hole_versions(remedy_row.pattern_id)
@@ -2022,6 +2028,9 @@ def select_hole_remedy(remedy_id: int, payload: RemedySelectRequest) -> dict:
         "fasteners": chosen["fasteners"],
         "uses_hole_correction": chosen["uses_hole_correction"],
         "hole_correction_budget_mm": chosen["hole_correction_budget_mm"],
+        "hole_correction_vectors_mm": chosen.get(
+            "hole_correction_vectors_mm", []),
+        "monte_carlo": {"samples": remedy_samples, "seed": remedy_seed},
         "frozen": "采纳结果冻结输入孔系、匹配关系与随机种子",
     }
     request_store = new_payload.model_dump(mode="json")
@@ -2031,7 +2040,7 @@ def select_hole_remedy(remedy_id: int, payload: RemedySelectRequest) -> dict:
         remedy_row.pattern_id, new_no, parent_version.id,
         adopted_name, payload.note, request_store,
         hole_model_snapshot(new_model), result,
-        new_payload.random_seed, new_payload.random_seed)
+        remedy_samples, remedy_seed)
     db.freeze_hole_remedy(remedy_row.id, payload.rank, payload.note,
                           new_version_id)
     saved_remedy = db.get_hole_remedy(remedy_row.id)

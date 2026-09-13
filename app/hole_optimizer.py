@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import replace
 from typing import Any
 
@@ -27,11 +28,11 @@ import numpy as np
 from .hole_schemas import RemedySearchRequest
 from .holes import (
     HoleModel,
-    sample_realization,
-    solve_pose_batch,
+    _ls_start_scalar,
+    _subgrad_scalar,
+    _vc_allowance,
+    monte_carlo,
     worst_case,
-    _FEAS_TOL,
-    _realization_batches,
 )
 
 
@@ -134,7 +135,9 @@ def _apply_candidate(model: HoleModel, drill: dict, fastener: dict,
                 features_b=[replace(x) for x in model.features_b],
                 bolt_nom=list(model.bolt_nom),
                 bolt_es=list(model.bolt_es),
-                bolt_ei=list(model.bolt_ei))
+                bolt_ei=list(model.bolt_ei),
+                bolt_lo=list(model.bolt_lo),
+                bolt_hi=list(model.bolt_hi))
     radius = np.zeros(m.n)
     enlarge = 0.0
     correction_shift = 0.0
@@ -151,10 +154,12 @@ def _apply_candidate(model: HoleModel, drill: dict, fastener: dict,
         i = m.mate_ids.index(mid)
         mid_d = 0.5 * (choice["upper"] + choice["lower"])
         if m.mate_kinds[i] == "float":
-            # 浮动连接件：写入螺栓极限（rad 用螺栓直径）
+            # 浮动连接件：写入螺栓极限（rad 与抽样都用直径极限）
             m.bolt_nom[i] = mid_d
             m.bolt_es[i] = choice["upper"] - mid_d
-            m.bolt_ei[i] = mid_d - choice["lower"]
+            m.bolt_ei[i] = choice["lower"] - mid_d
+            m.bolt_lo[i] = choice["lower"]
+            m.bolt_hi[i] = choice["upper"]
         else:
             # 固定螺栓（无 feature_b 的合成销）：直接改 B 侧销直径
             pin = m.features_b[i] if m.ext_sides[i] == "B" else m.features_a[i]
@@ -188,6 +193,61 @@ def _candidate_iter(model: HoleModel, tables: dict, include_correction: bool,
             yield drill, fastener
 
 
+# ----------------------------------------------------- 孔位修正（确定性）
+
+def _shifted_model(model: HoleModel, shifts: dict[str, np.ndarray]) -> HoleModel:
+    """把 A 侧名义孔位平移 shifts[mate_id]=(sx,sy) mm，返回新模型。"""
+    m = replace(model, features_a=[replace(x) for x in model.features_a])
+    for i, mid in enumerate(m.mate_ids):
+        if mid in shifts:
+            sx, sy = shifts[mid]
+            m.features_a[i].x += float(sx)
+            m.features_a[i].y += float(sy)
+    return m
+
+
+def _correction_shifts(model: HoleModel, budget: dict[str, float],
+                       locked: set[str]) -> dict[str, np.ndarray]:
+    """从最坏边界最优位姿导出每个可修正匹配位的确定性平移矢量。
+
+    圆盘约束 |R(θ)pB+t−pA−s_i| ≤ a_i：把 A 孔朝 B 侧实际中心方向移 s_i，
+    在预算内取 s_i = min(b_i, 间隙不足量)·u_i，其中 u_i 为最优位姿下
+    B 中心相对 A 中心的单位方向。这样最坏边界的修正收益被逐点实现，
+    采纳后重算的版本与候选结果同源、同结论。
+    """
+    rad, _ = _vc_allowance(model)
+    PA = np.array([[f.x, f.y] for f in model.features_a])
+    PB = np.array([[f.x, f.y] for f in model.features_b])
+    # 预算作为自由半径只用于找"如果允许修正，位姿应朝哪走"的方向，
+    # 真正的收益仍由平移后的名义孔位决定（不夸大）。
+    inflated = rad.copy()
+    for i, mid in enumerate(model.mate_ids):
+        if mid in budget and mid not in locked:
+            inflated[i] += budget[mid]
+    x_ls = _ls_start_scalar(PA, PB, PA, model.theta_max_rad)
+    x, g, gv = _subgrad_scalar(x_ls, PA, PB, PA, inflated,
+                               model.theta_max_rad, 400)
+    th = x[2]
+    c, s = math.cos(th), math.sin(th)
+    posed_B = np.column_stack([c * PB[:, 0] - s * PB[:, 1] + x[0],
+                               s * PB[:, 0] + c * PB[:, 1] + x[1]])
+    shifts: dict[str, np.ndarray] = {}
+    for i, mid in enumerate(model.mate_ids):
+        if mid not in budget or mid in locked:
+            continue
+        v = posed_B[i] - PA[i]
+        dist = float(np.hypot(v[0], v[1]))
+        b = budget[mid]
+        if dist <= 1e-12 or b <= 0.0:
+            continue
+        # 朝 B 侧方向移动，幅度不超过预算；间隙已够（dist≤rad）时无需修正
+        need = max(0.0, dist - rad[i])
+        mag = min(b, need)
+        if mag > 0.0:
+            shifts[mid] = np.array([v[0] / dist * mag, v[1] / dist * mag])
+    return shifts
+
+
 # ----------------------------------------------------- 主体搜索
 
 def search_remedies(model: HoleModel, payload: RemedySearchRequest) -> dict[str, Any]:
@@ -200,22 +260,15 @@ def search_remedies(model: HoleModel, payload: RemedySearchRequest) -> dict[str,
     if not payload.include_correction:
         correction_budget = {}
 
-    # 共享固定种子：所有候选用同种子同源子流抽样（见 evaluate）
+    def evaluate(m: HoleModel):
+        """对最终模型（孔径/螺栓/孔位已固化）做最坏边界 + 固定种子 MC。
 
-    def evaluate(m: HoleModel, radius_inflate: np.ndarray):
-        wc = worst_case(m, extra_radius=radius_inflate)
-        # 孔径候选改变直径分布与 bonus：同种子重抽，保证候选间可重复对照
-        draw = sample_realization(m, n_samples, seed=seed)
-        P, T, rad = _realization_batches(m, draw, radius_inflate)
-        mc_points = m.mc_theta_points + (m.mc_theta_points % 2 == 0)
-        theta_starts = tuple(np.linspace(
-            -m.theta_max_rad, m.theta_max_rad, mc_points))
-        sol0 = solve_pose_batch(P, T, rad, m.theta_max_rad, iters=70)
-        sol1 = solve_pose_batch(P, T, rad, m.theta_max_rad, iters=70,
-                                theta_starts=theta_starts)
-        g = np.minimum(sol0["g"], sol1["g"])
-        fail = float((g > _FEAS_TOL).mean())
-        return wc, fail
+        MC 直接调用分析模块（与版本采纳后重算完全同源），
+        保证候选声称的失败概率等于采纳后新版本的失败概率。
+        """
+        wc = worst_case(m)
+        mc = monte_carlo(m, n_samples, seed=seed)
+        return wc, mc["failure_probability"]
 
     candidates = []
     count = 0
@@ -225,7 +278,7 @@ def search_remedies(model: HoleModel, payload: RemedySearchRequest) -> dict[str,
         if count >= payload.max_candidates:
             truncate = True
             break
-        m, radius, enlarge, _ = _apply_candidate(model, drill, fastener)
+        base_m, _, enlarge, _ = _apply_candidate(model, drill, fastener)
         # 每个 (钻孔, 连接件) 组合给两种变体：不修正 / 使用声明的孔位修正；
         # 零改动零修正的现状方案因此必然在候选集合中。
         use_correction = bool(payload.include_correction and correction_budget)
@@ -234,14 +287,23 @@ def search_remedies(model: HoleModel, payload: RemedySearchRequest) -> dict[str,
             if count >= payload.max_candidates:
                 truncate = True
                 break
-            radius_v = radius.copy()
+            shifts: dict[str, np.ndarray] = {}
+            shift_records = []
             shift_max = 0.0
             if use_shift:
-                for i, mid in enumerate(m.mate_ids):
-                    if mid in correction_budget and mid not in locked_mates:
-                        radius_v[i] += correction_budget[mid]
-                        shift_max = max(shift_max, correction_budget[mid])
-            wc, fail = evaluate(m, radius_v)
+                shifts = _correction_shifts(
+                    base_m, correction_budget, locked_mates)
+                for mid, v in shifts.items():
+                    mag = float(np.hypot(v[0], v[1]))
+                    shift_max = max(shift_max, mag)
+                    shift_records.append({
+                        "mate_id": mid,
+                        "shift_x_mm": float(v[0]),
+                        "shift_y_mm": float(v[1]),
+                        "shift_magnitude_mm": mag,
+                        "max_allowed_mm": correction_budget[mid]})
+            eval_m = _shifted_model(base_m, shifts) if shifts else base_m
+            wc, fail = evaluate(eval_m)
             count += 1
             candidates.append({
                 "drill": [
@@ -260,6 +322,7 @@ def search_remedies(model: HoleModel, payload: RemedySearchRequest) -> dict[str,
                     {"mate_id": mid, "max_shift_mm": v}
                     for mid, v in sorted(correction_budget.items())
                     if use_shift and mid not in locked_mates],
+                "hole_correction_vectors_mm": shift_records,
                 "max_hole_shift_mm": shift_max,
                 "hole_enlargement_total_mm": enlarge,
                 "worst_case_feasible": bool(wc["feasible"]),
@@ -277,7 +340,6 @@ def search_remedies(model: HoleModel, payload: RemedySearchRequest) -> dict[str,
         c["failure_probability"],
         c["max_hole_shift_mm"],
         c["hole_enlargement_total_mm"],
-        # 稳定次序：改动少者优先，再按描述
         -(1 if c["worst_case_feasible"] else 0),
     ))
     for rank, c in enumerate(candidates, start=1):
@@ -295,13 +357,16 @@ def search_remedies(model: HoleModel, payload: RemedySearchRequest) -> dict[str,
         "truncated": truncate,
         "ranking_note":
             "排序键（越小越优）：固定种子 MC 失败概率 → 最大孔位改动(mm) "
-            "→ 孔径放大总量(mm)；零改动现状方案始终参与复核",
+            "→ 孔径放大总量(mm)；零改动现状方案始终参与复核；"
+            "孔位修正以最坏边界最优位姿导出的确定性平移矢量固化，"
+            "采纳后新版本失败概率与本结果一致",
         "baseline": baseline,
         "candidates": candidates,
         "shared_sampling": {
-            "policy": "所有候选共用同种子同源子流样本（位置/基准/直径），"
-                      "候选间差异只来自孔径/螺栓/修正选择",
+            "policy": "所有候选用同种子、同样本数经分析模块蒙特卡洛评定，"
+                      "候选间差异只来自孔径/螺栓/孔位修正选择",
             "seed": seed,
+            "samples": n_samples,
         },
     }
 
@@ -309,11 +374,13 @@ def search_remedies(model: HoleModel, payload: RemedySearchRequest) -> dict[str,
 # ----------------------------------------------------- 采纳：冻结为新版本输入
 
 def freeze_payload(model: HoleModel, candidate: dict, name: str, note: str,
-                   parent_payload):
-    """把选中候选应用到父版本提交，返回可直接建新版本的 HolePatternCreate 字典。
+                   parent_payload, mc_samples: int | None = None,
+                   seed: int | None = None):
+    """把选中候选应用到父版本提交，返回可直接建新版本的 HolePatternCreate。
 
-    放大孔径 / 螺栓规格写入对应要素；孔位修正只记录采纳预算（实际修正由
-    加工按装配求解位姿执行），匹配关系与种子保持冻结。
+    放大孔径 / 螺栓规格写入对应要素；孔位修正按求解出的确定性平移矢量
+    写入 A 侧名义孔坐标（采纳后新版本重算结果与候选同源）；
+    匹配关系保持冻结；mc_samples/seed 缺省沿用父版本。
     """
     from .hole_schemas import HolePatternCreate
 
@@ -321,12 +388,25 @@ def freeze_payload(model: HoleModel, candidate: dict, name: str, note: str,
         parent_payload, "model_dump") else dict(parent_payload)
     data["name"] = name
     data["note"] = note
+    if mc_samples is not None:
+        data["mc_samples"] = mc_samples
+    if seed is not None:
+        data["random_seed"] = seed
     drill_map = {(d["side"], d["mate_id"]): d for d in candidate["drill"]}
     fast_map = {d["mate_id"]: d for d in candidate["fasteners"]}
+    shift_map = {v["mate_id"]: v for v in candidate.get(
+        "hole_correction_vectors_mm", [])}
     inv = 1.0 / model.factor
     mate_index = {mid: i for i, mid in enumerate(model.mate_ids)}
     for m in data["mates"]:
         i = mate_index[m["id"]]
+        # 采纳孔位修正：把确定性平移矢量（mm）写入 A 侧名义坐标（提交单位）
+        sv = shift_map.get(m["id"])
+        if sv is not None:
+            m["feature_a"]["x"] = m["feature_a"].get("x", 0.0) \
+                + sv["shift_x_mm"] * inv
+            m["feature_a"]["y"] = m["feature_a"].get("y", 0.0) \
+                + sv["shift_y_mm"] * inv
         for side in ("a", "b"):
             key = f"feature_{side}"
             d = drill_map.get((side, m["id"]))
@@ -358,6 +438,8 @@ def freeze_payload(model: HoleModel, candidate: dict, name: str, note: str,
         "drill": candidate["drill"],
         "fasteners": candidate["fasteners"],
         "hole_correction_budget_mm": candidate["hole_correction_budget_mm"],
+        "hole_correction_vectors_mm": candidate.get(
+            "hole_correction_vectors_mm", []),
         "frozen": "采纳结果冻结输入孔系、匹配关系与随机种子",
     }
     return HolePatternCreate.model_validate(data)

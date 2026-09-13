@@ -528,6 +528,84 @@ def test_remedy_improves_failure_probability():
     assert keys == sorted(keys)
 
 
+# ----------------------------------------------------- 数据处理回归
+
+def test_bolt_diameter_samples_cover_full_interval():
+    """螺栓极限 9~11 均匀分布：样本必须覆盖完整区间（不得退化成上限）。"""
+    from app.holes import sample_realization
+    fixed = hole_feat(0, 0, nominal_diameter=10.0,
+                      diameter_upper_deviation=0.0,
+                      diameter_lower_deviation=0.0,
+                      position_tolerance=0.0, material_condition="RFS",
+                      distribution="uniform",
+                      diameter_std_dev=None, position_std_dev=None)
+    # 浮动螺栓（双孔）
+    p_float = HolePatternCreate(name="b-float", mc_samples=20000, random_seed=7,
+        mates=[{"id": "M1", "feature_a": dict(fixed), "feature_b": dict(fixed),
+                "bolt_diameter_upper": 11.0, "bolt_diameter_lower": 9.0}])
+    m = build_model(p_float)
+    bolt = sample_realization(m, 20000, seed=7)["bolt"][:, 0]
+    assert bolt.min() < 9.2 and bolt.max() > 10.8
+    assert bolt.mean() == pytest.approx(10.0, abs=0.05)
+    rate = analyze(p_float)["monte_carlo"]["assembly_success_rate"]
+    # 孔固定 Φ10：螺栓 ≤10 才能装入，成功率约 1/2
+    assert 0.40 < rate < 0.60
+
+    # 固定螺栓（无 feature_b）同样覆盖区间
+    p_fixed = HolePatternCreate(name="b-fixed", mc_samples=20000, random_seed=7,
+        mates=[{"id": "M1", "feature_a": dict(fixed),
+                "bolt_diameter_upper": 11.0, "bolt_diameter_lower": 9.0}])
+    m2 = build_model(p_fixed)
+    pin = sample_realization(m2, 20000, seed=7)["diameters"][("B", 0)]
+    assert pin.min() < 9.2 and pin.max() > 10.8
+    assert pin.mean() == pytest.approx(10.0, abs=0.05)
+
+
+def test_correction_shift_is_deterministic_and_frozen():
+    """孔位修正导出确定性平移矢量：采纳后重算失败概率与候选一致。"""
+    from app.hole_optimizer import freeze_payload, search_remedies
+
+    def mate(mid, ax, ay, bx, by):
+        f = dict(kind="hole", nominal_diameter=10.0,
+                 diameter_upper_deviation=0.0, diameter_lower_deviation=0.0,
+                 position_tolerance=0.0, material_condition="RFS",
+                 distribution="uniform")
+        return {"id": mid,
+                "feature_a": {**f, "x": ax, "y": ay},
+                "feature_b": {**f, "x": bx, "y": by},
+                "bolt_diameter_upper": 10.0, "bolt_diameter_lower": 10.0}
+
+    p = HolePatternCreate(name="corr", mc_samples=2000, random_seed=7,
+        mates=[mate("M1", 0, 0, 0.2, 0), mate("M2", 40, 0, 39.8, 0)])
+    model = build_model(p)
+    req = RemedySearchRequest(
+        name="fix", mc_samples=1000, random_seed=7,
+        correction_options=[{"mate_id": "M1", "max_shift": 0.25},
+                            {"mate_id": "M2", "max_shift": 0.25}])
+    res = search_remedies(model, req)
+    assert res["baseline"]["failure_probability"] == 1.0
+    top = res["candidates"][0]
+    assert top["uses_hole_correction"]
+    assert top["failure_probability"] == 0.0
+    vec = {v["mate_id"]: (v["shift_x_mm"], v["shift_y_mm"])
+           for v in top["hole_correction_vectors_mm"]}
+    assert vec["M1"][0] == pytest.approx(0.2, abs=1e-9)
+    assert vec["M2"][0] == pytest.approx(-0.2, abs=1e-9)
+    assert top["max_hole_shift_mm"] == pytest.approx(0.2, abs=1e-9)
+
+    # 冻结为新版本输入并重算：失败概率必须保持 0
+    new_payload = freeze_payload(model, top, "corr-adopted", "", p,
+                                 mc_samples=1000, seed=7)
+    assert new_payload.mc_samples == 1000
+    assert new_payload.random_seed == 7
+    xs = [m.feature_a.x for m in new_payload.mates]
+    assert xs[0] == pytest.approx(0.2, abs=1e-9)
+    assert xs[1] == pytest.approx(39.8, abs=1e-9)
+    adopted = analyze(new_payload)
+    assert adopted["monte_carlo"]["failure_probability"] == \
+        top["failure_probability"]
+
+
 # ------------------------------------------------------------- API
 
 def test_api_create_get_freeze_and_422(client):
@@ -612,3 +690,45 @@ def test_api_remedy_unknown_mate_422(client):
                               "diameter_upper": 9.0,
                               "diameter_lower": 8.9}]})
     assert r.status_code == 422 and "GHOST" in r.text
+
+
+def test_api_adopt_keeps_correction_samples_and_seed(client):
+    """采纳孔位修正：新版本保留修正效果，且 mc_samples/seed 取整改请求值。"""
+    f = dict(kind="hole", nominal_diameter=10.0,
+             diameter_upper_deviation=0.0, diameter_lower_deviation=0.0,
+             position_tolerance=0.0, material_condition="RFS",
+             distribution="uniform")
+
+    def mate(mid, ax, bx):
+        return {"id": mid,
+                "feature_a": {**f, "x": ax[0], "y": ax[1]},
+                "feature_b": {**f, "x": bx[0], "y": bx[1]},
+                "bolt_diameter_upper": 10.0, "bolt_diameter_lower": 10.0}
+
+    payload = {"name": "api-adopt", "mc_samples": 5000, "random_seed": 7,
+               "mates": [mate("M1", (0, 0), (0.2, 0)),
+                         mate("M2", (40, 0), (39.8, 0))]}
+    vid = client.post("/hole-patterns", json=payload).json()["version_id"]
+    rem = {"name": "fix", "mc_samples": 1000, "random_seed": 7,
+           "correction_options": [{"mate_id": "M1", "max_shift": 0.25},
+                                  {"mate_id": "M2", "max_shift": 0.25}]}
+    rj = client.post(f"/hole-versions/{vid}/remedies", json=rem).json()
+    top = rj["result"]["candidates"][0]
+    assert top["failure_probability"] == 0.0
+    sr = client.post(f"/hole-remedies/{rj['remedy_id']}/select",
+                     json={"rank": top["rank"]})
+    assert sr.status_code == 200, sr.text
+    v = sr.json()
+    assert v["mc_samples"] == 1000
+    assert v["result"]["monte_carlo"]["samples"] == 1000
+    assert v["result"]["monte_carlo"]["random_seed"] == 7
+    assert v["result"]["monte_carlo"]["failure_probability"] == \
+        top["failure_probability"]
+    # 修正量已固化为 A 侧名义孔位
+    xs = [m["feature_a"]["x"] for m in v["submitted_input"]["mates"]]
+    assert xs[0] == pytest.approx(0.2, abs=1e-9)
+    assert xs[1] == pytest.approx(39.8, abs=1e-9)
+    # 重新 GET 冻结版本结果不变
+    got = client.get(f"/hole-versions/{v['version_id']}").json()
+    assert got["result"]["monte_carlo"]["failure_probability"] == 0.0
+    assert got["mc_samples"] == 1000

@@ -131,6 +131,9 @@ class HoleModel:
     bolt_nom: list[float | None]
     bolt_es: list[float | None]
     bolt_ei: list[float | None]
+    # 浮动螺栓直径极限（mm，仅 float 匹配位非 None）
+    bolt_lo: list[float | None]
+    bolt_hi: list[float | None]
     frames: dict[str, list[_Datum]]
     mc_samples: int
     seed: int
@@ -175,6 +178,8 @@ def build_model(payload: HolePatternCreate) -> HoleModel:
     bolt_nom: list[float | None] = []
     bolt_es: list[float | None] = []
     bolt_ei: list[float | None] = []
+    bolt_lo: list[float | None] = []
+    bolt_hi: list[float | None] = []
 
     def feat(f, mate_id: str, side: str) -> _Feature:
         return _Feature(
@@ -208,8 +213,8 @@ def build_model(payload: HolePatternCreate) -> HoleModel:
                 es=(m.bolt_diameter_upper
                     - 0.5 * (m.bolt_diameter_upper + m.bolt_diameter_lower))
                 * factor,
-                ei=(0.5 * (m.bolt_diameter_upper + m.bolt_diameter_lower)
-                    - m.bolt_diameter_lower) * factor,
+                ei=-(0.5 * (m.bolt_diameter_upper + m.bolt_diameter_lower)
+                     - m.bolt_diameter_lower) * factor,
                 tol=0.0, mc=MaterialCondition.RFS.value,
                 distribution="uniform", d_sigma=None, p_sigma=None,
                 refs=(),
@@ -223,6 +228,8 @@ def build_model(payload: HolePatternCreate) -> HoleModel:
             bolt_nom.append(None)
             bolt_es.append(None)
             bolt_ei.append(None)
+            bolt_lo.append(m.bolt_diameter_lower * factor)
+            bolt_hi.append(m.bolt_diameter_upper * factor)
             continue
 
         fb.append(feat(m.feature_b, m.id, "B"))
@@ -240,13 +247,17 @@ def build_model(payload: HolePatternCreate) -> HoleModel:
             mid = 0.5 * (m.bolt_diameter_upper + m.bolt_diameter_lower)
             bolt_nom.append(mid * factor)
             bolt_es.append((m.bolt_diameter_upper - mid) * factor)
-            bolt_ei.append((mid - m.bolt_diameter_lower) * factor)
+            bolt_ei.append((m.bolt_diameter_lower - mid) * factor)
+            bolt_lo.append(m.bolt_diameter_lower * factor)
+            bolt_hi.append(m.bolt_diameter_upper * factor)
         else:
             kinds.append("fixed")
             ext_sides.append("B" if b_hole is False else "A")
             bolt_nom.append(None)
             bolt_es.append(None)
             bolt_ei.append(None)
+            bolt_lo.append(None)
+            bolt_hi.append(None)
 
     frames = {
         "A": [_build_datum(d, factor) for d in payload.frame_a.datums],
@@ -257,7 +268,8 @@ def build_model(payload: HolePatternCreate) -> HoleModel:
         mate_ids=[m.id for m in payload.mates],
         features_a=fa, features_b=fb, mate_kinds=kinds,
         ext_sides=ext_sides, bolt_nom=bolt_nom, bolt_es=bolt_es,
-        bolt_ei=bolt_ei, frames=frames,
+        bolt_ei=bolt_ei, bolt_lo=bolt_lo, bolt_hi=bolt_hi,
+        frames=frames,
         mc_samples=payload.mc_samples, seed=payload.random_seed,
         theta_max_rad=math.radians(payload.theta_search_deg),
         theta_grid=payload.theta_grid_points,
@@ -417,9 +429,10 @@ def sample_realization(model: HoleModel, n: int, seed: int | None = None,
         for i in range(model.n):
             if model.mate_kinds[i] != "float":
                 continue
-            bolt[:, i] = _sample_diameter(
-                rng_b, model.bolt_nom[i], model.bolt_es[i], model.bolt_ei[i],
-                "uniform", None, n)
+            # 螺栓直径在 [下极限, 上极限] 上均匀分布（不经偏差符号换算，
+            # 避免极限表示被当成下偏差而退化为上极限）
+            bolt[:, i] = model.bolt_lo[i] \
+                + (model.bolt_hi[i] - model.bolt_lo[i]) * rng_b.random(n)
     return {"diameters": diameters, "positions": positions, "bolt": bolt}
 
 

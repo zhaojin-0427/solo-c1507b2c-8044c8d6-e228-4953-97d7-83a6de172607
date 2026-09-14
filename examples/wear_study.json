@@ -1,0 +1,44 @@
+{
+  "name": "gearbox-wear-v1",
+  "note": "减速箱端隙服役磨损：壳体轴承孔磨大(L1增大)、隔套端面磨损(L2减小)、轴颈磨损(L3减小)；L1/L3 共用载荷正相关 0.6",
+  "dimensions": [
+    {
+      "dimension_id": "L1",
+      "wear_direction": "increase",
+      "wear_curve": [
+        {"start_cycles": 0, "end_cycles": 10000, "start_wear": 0.0, "end_wear": 0.02},
+        {"start_cycles": 10000, "end_cycles": 30000, "start_wear": 0.02, "end_wear": 0.09}
+      ],
+      "curve_unit": "mm",
+      "rate_std_dev": 1e-6
+    },
+    {
+      "dimension_id": "L2",
+      "wear_direction": "decrease",
+      "wear_curve": [
+        {"start_cycles": 0, "end_cycles": 30000, "start_wear": 0.0, "end_wear": 0.05}
+      ],
+      "curve_unit": "mm",
+      "rate_std_dev": 8e-7
+    },
+    {
+      "dimension_id": "L3",
+      "wear_direction": "decrease",
+      "wear_curve": [
+        {"start_cycles": 0, "end_cycles": 10000, "start_wear": 0.0, "end_wear": 0.03},
+        {"start_cycles": 10000, "end_cycles": 30000, "start_wear": 0.03, "end_wear": 0.12}
+      ],
+      "curve_unit": "mm",
+      "rate_std_dev": 1.5e-6
+    }
+  ],
+  "wear_rate_correlations": [
+    {"dim_a": "L1", "dim_b": "L3", "rho": 0.6}
+  ],
+  "evaluation_cycles": [0, 5000, 10000, 15000, 20000, 25000, 30000],
+  "closure_lower_limit": 0.0,
+  "closure_upper_limit": 0.9,
+  "closure_unit": "mm",
+  "mc_samples": 50000,
+  "random_seed": 20260917
+}

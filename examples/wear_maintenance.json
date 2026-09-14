@@ -1,0 +1,42 @@
+{
+  "name": "gearbox-wear-maint-v1",
+  "note": "端隙磨损维护编排：轴(L3)为不可更换件；减隙垫片 0.1/0.2mm；隔套与壳体可更换；每次维护停机成本 120",
+  "locked_dimensions": [
+    "L3"
+  ],
+  "shim_candidates": [
+    {
+      "shim_id": "SHIM-010",
+      "name": "0.1mm 调整垫片",
+      "thickness": 0.1,
+      "std_dev": 0.005,
+      "unit": "mm",
+      "closure_sign": -1,
+      "cost": 40
+    },
+    {
+      "shim_id": "SHIM-020",
+      "name": "0.2mm 调整垫片",
+      "thickness": 0.2,
+      "std_dev": 0.008,
+      "unit": "mm",
+      "closure_sign": -1,
+      "cost": 65
+    }
+  ],
+  "maintainable_cycles": [
+    10000,
+    15000,
+    20000,
+    25000,
+    30000
+  ],
+  "replacement_costs": {
+    "L1": 280,
+    "L2": 150
+  },
+  "downtime_cost": 120,
+  "criterion": "worst_case",
+  "mc_samples": 20000,
+  "max_candidates": 10
+}

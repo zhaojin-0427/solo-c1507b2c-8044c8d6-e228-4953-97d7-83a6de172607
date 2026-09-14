@@ -14,6 +14,8 @@
 * hole_patterns      孔系装配对象（版本线；一对零件的孔/销/螺栓与基准框架）
 * hole_versions      孔系版本（匹配位/基准框架快照 + WC/MC 结果，冻结）
 * hole_remedies      孔系整改搜索结果（候选钻孔/连接件/孔位修正；采纳后冻结）
+* wear_studies       服役磨损研究（冻结基线链上的磨损曲线/节点/限值，冻结）
+* wear_maintenances  磨损维护编排搜索结果（继续/垫片/更换方案；选定后冻结）
 """
 from __future__ import annotations
 
@@ -399,6 +401,51 @@ class HoleRemedyRow(Base):
     selected_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
     selected_version_id: Mapped[int | None] = mapped_column(
         Integer, nullable=True)
+    selected_note: Mapped[str] = mapped_column(Text, default="")
+    frozen: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class WearStudyRow(Base):
+    """服役磨损研究：冻结基线链上独立成版，创建即冻结（基线不被覆盖）。"""
+
+    __tablename__ = "wear_studies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(
+        ForeignKey("chains.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    # 原始请求（逐尺寸磨损曲线 / 计算节点 / 封闭环限值原样冻结）
+    request_json: Mapped[dict] = mapped_column(JSON)
+    # 归一化磨损模型快照（曲线 mm / 速率 σ / 相关矩阵 / 节点）
+    model_json: Mapped[dict] = mapped_column(JSON)
+    # 创建时一次性算好的逐节点结果（含固定种子 MC 与首次越界分布）
+    result_json: Mapped[dict] = mapped_column(JSON)
+    mc_samples: Mapped[int] = mapped_column(Integer)
+    random_seed: Mapped[int] = mapped_column(Integer)
+    frozen: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class WearMaintenanceRow(Base):
+    """磨损维护编排搜索结果：候选表 / 种子随请求冻结；选定方案后固化。"""
+
+    __tablename__ = "wear_maintenances"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    study_id: Mapped[int] = mapped_column(
+        ForeignKey("wear_studies.id", ondelete="CASCADE"), index=True
+    )
+    chain_id: Mapped[int] = mapped_column(
+        ForeignKey("chains.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    request_json: Mapped[dict] = mapped_column(JSON)
+    result_json: Mapped[dict] = mapped_column(JSON)
+    selected_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
     selected_note: Mapped[str] = mapped_column(Text, default="")
     frozen: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
@@ -1298,6 +1345,109 @@ def freeze_hole_remedy(remedy_id: int, rank: int, note: str,
         row = s.get(HoleRemedyRow, remedy_id)
         row.selected_rank = rank
         row.selected_version_id = new_version_id
+        row.selected_note = note
+        row.frozen = 1
+        s.commit()
+
+
+# ------------------------------------------------------- 服役磨损研究 CRUD
+
+def save_wear_study(chain_id: int, name: str, note: str,
+                    request: dict, model_snapshot: dict, result: dict,
+                    mc_samples: int, seed: int) -> int:
+    with session_factory() as s:
+        row = WearStudyRow(
+            chain_id=chain_id, name=name, note=note,
+            request_json=request, model_json=model_snapshot,
+            result_json=result, mc_samples=mc_samples, random_seed=seed,
+            frozen=1,
+        )
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def get_wear_study(study_id: int) -> WearStudyRow | None:
+    with session_factory() as s:
+        row = s.get(WearStudyRow, study_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_wear_studies(chain_id: int) -> list[dict]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(WearStudyRow)
+            .where(WearStudyRow.chain_id == chain_id)
+            .order_by(WearStudyRow.id)
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "chain_id": r.chain_id,
+                "name": r.name,
+                "note": r.note,
+                "mc_samples": r.mc_samples,
+                "random_seed": r.random_seed,
+                "frozen": bool(r.frozen),
+                "node_count": r.result_json["summary"]["node_count"],
+                "final_cycles": r.result_json["summary"]["final_cycles"],
+                "worst_reject_probability":
+                    r.result_json["summary"]["worst_reject_probability"],
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+def save_wear_maintenance(study_id: int, chain_id: int, name: str,
+                          note: str, request: dict, result: dict) -> int:
+    with session_factory() as s:
+        row = WearMaintenanceRow(
+            study_id=study_id, chain_id=chain_id, name=name, note=note,
+            request_json=request, result_json=result, frozen=0)
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def get_wear_maintenance(search_id: int) -> WearMaintenanceRow | None:
+    with session_factory() as s:
+        row = s.get(WearMaintenanceRow, search_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_wear_maintenances(study_id: int) -> list[dict]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(WearMaintenanceRow)
+            .where(WearMaintenanceRow.study_id == study_id)
+            .order_by(WearMaintenanceRow.id)
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "study_id": r.study_id,
+                "chain_id": r.chain_id,
+                "name": r.name,
+                "note": r.note,
+                "frozen": bool(r.frozen),
+                "selected_rank": r.selected_rank,
+                "candidate_count": len(r.result_json.get("candidates", [])),
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+def freeze_wear_maintenance(search_id: int, rank: int, note: str) -> None:
+    """幂等选定：写入 selected_rank 并置 frozen=1（调用方保证只选一次）。"""
+    with session_factory() as s:
+        row = s.get(WearMaintenanceRow, search_id)
+        row.selected_rank = rank
         row.selected_note = note
         row.frozen = 1
         s.commit()

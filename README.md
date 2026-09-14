@@ -115,6 +115,11 @@ python3 -m venv --without-pip .venv        # 若 venv 自带 pip 可省略 get-p
 | POST | `/hole-versions/{vid}/remedies` | 整改组合搜索（候选钻孔/连接件/孔位修正，按失败概率与改动量排序） |
 | GET | `/hole-versions/{vid}/remedies` / `/hole-remedies/{id}` | 整改结果列表 / 冻结详情 |
 | POST | `/hole-remedies/{id}/select` | 采纳候选并冻结为新版本（输入孔系、匹配关系、种子固化，只能采纳一次） |
+| POST | `/chains/{id}/wear-studies` | 从冻结基线建立**服役磨损研究**（磨损方向/分段线性累计磨损曲线/速率σ/共用载荷相关 + 计算节点/封闭环限值/固定种子） |
+| GET | `/chains/{id}/wear-studies` / `/wear-studies/{sid}` | 研究列表 / 读取冻结研究（重复读取结果不变） |
+| POST | `/wear-studies/{sid}/maintenance-searches` | 维护编排搜索（继续使用/加垫片/更换零件，按违规数→最早越界点→总成本排列） |
+| GET | `/wear-studies/{sid}/maintenance-searches` / `/wear-maintenance-searches/{mid}` | 编排结果列表 / 冻结详情 |
+| POST | `/wear-maintenance-searches/{mid}/select` | 选定维护方案并冻结（来源链/磨损曲线/维护动作/种子固化，只能选一次） |
 
 ## 典型流程
 
@@ -156,6 +161,14 @@ curl -s -X POST localhost:8000/thermal-analyses/1/proposals \
 # 8) 量具 R&R 研究（L1 的 零件×操作者×重复 交叉表）
 curl -s -X POST localhost:8000/chains/1/gage-rr-studies \
   -H 'Content-Type: application/json' -d @examples/gage_rr_study.json
+
+# 9) 服役磨损研究（分段线性磨损曲线 + 计算节点），再编排维护方案并选定冻结
+curl -s -X POST localhost:8000/chains/1/wear-studies \
+  -H 'Content-Type: application/json' -d @examples/wear_study.json
+curl -s -X POST localhost:8000/wear-studies/1/maintenance-searches \
+  -H 'Content-Type: application/json' -d @examples/wear_maintenance.json
+curl -s -X POST localhost:8000/wear-maintenance-searches/1/select \
+  -H 'Content-Type: application/json' -d '{"rank":1,"note":"采纳最低成本方案"}'
 ```
 
 ### 成本模型
@@ -649,6 +662,84 @@ curl -s -X POST localhost:8000/hole-patterns \
   **均匀抽样**（覆盖完整直径区间，而非取上极限）；最坏边界仍按上极限
   （最大实体）保守判定。
 
+## 服役磨损研究（随循环数的尺寸链退化）
+
+在**冻结基线链**之上独立成版（示例 `examples/wear_study.json`），评估
+服役循环累计磨损对封闭环的影响：
+
+```bash
+curl -s -X POST localhost:8000/chains/1/wear-studies \
+  -H 'Content-Type: application/json' -d @examples/wear_study.json
+```
+
+基线链**不被覆盖**，磨损曲线 / 计算节点 / 封闭环限值 / 随机种子随研究
+冻结；同一研究重复计算、重复读取结果不变，后续基线变化不改写历史研究。
+
+### 逐尺寸磨损参数与计算节点
+
+* `dimensions[]` 必须**恰好覆盖**基线链全部尺寸（漏填 / 链外 / 重复均
+  422），每项给：
+  * `wear_direction`：磨损后尺寸**增大**（如孔磨大）或**减小**（如轴磨小）；
+  * `wear_curve`：**分段线性累计磨损曲线**——首段必须从 (0, 0) 出发，
+    相邻段必须共用同一折点（**衔接校验**：循环数与累计磨损都一致），
+    段内循环数严格递增、累计磨损单调不减；折点值可按任意支持单位提交，
+    内部统一换算为 mm；
+  * `rate_std_dev`：磨损速率标准差（单位/循环）。**随机速率模型**：
+    同一零件整个服役期速率偏差恒定，N 循环后累计磨损标准差 =
+    速率σ × N（N=0 时无磨损不确定性）。
+* `wear_rate_correlations` 描述共用载荷导致的速率 Pearson 相关，组装
+  相关矩阵并校验取值范围、对称性与**半正定性**（与基线链同一口径）。
+* `evaluation_cycles` 为严格递增的计算节点（循环数，至少 2 个），不得
+  超出任何尺寸曲线的覆盖范围（不外推）；`closure_lower/upper_limit`
+  至少给一侧，作为本研究的封闭环限值（可与基线规格不同）。
+
+### 每个节点返回的量
+
+封闭环 `C(N) = C(0) + Σ s_i·d_i·[μ_i(N) + σ_ri·N·Z_i]`（s_i 闭环符号、
+d_i 磨损方向，复用基线链口径）：
+
+* **均值与磨损平移**、**极值界**（制造散布取公差带线性累加 ΣT_i；
+  磨损不确定度按 ±3σ 扩展，与热分析同口径）；
+* **RSS**：`σ²_C(N) = σ²_制造 + N²·Σ c_i c_j ρ^w_ij σ_ri σ_rj`
+  （制造散布与磨损速率独立，方差相加），±3σ 界与正态近似超差率；
+* **固定种子蒙特卡洛**：`SeedSequence([seed, 0x77656172]).spawn(2)`
+  派生制造散布（复用基线链抽样器，含基线相关与 copula 口径）与磨损
+  速率（相关正态，Cholesky）两个子流；**所有计算节点共用同一组样本**
+  （同一批零件），给出各节点超差率、0.5/99.5% 分位与样本极值；
+* **首次越界循环分布**：逐样本按节点顺序扫描首次越出限值的节点，
+  给出逐节点计数/占比、从未越界占比与越界循环分位数（节点间分段线性
+  轨迹可能更早越界，未计入）；解析口径另给**最早越界节点**（先 WC
+  硬界实际穿过限值，再 RSS ±3σ 界穿过）；
+* **逐尺寸贡献**：累计磨损、对封闭环的均值平移、制造/磨损方差贡献
+  与占比（各节点占比之和为 1）。
+
+### 维护编排与选定冻结
+
+```bash
+curl -s -X POST localhost:8000/wear-studies/1/maintenance-searches \
+  -H 'Content-Type: application/json' -d @examples/wear_maintenance.json
+curl -s -X POST localhost:8000/wear-maintenance-searches/1/select \
+  -H 'Content-Type: application/json' -d '{"rank":1}'
+```
+
+* `locked_dimensions` 锁定不可更换件；`replacement_costs` 列出可更换件
+  单次更换成本（两者重叠 422）；`shim_candidates` 给垫片规格（名义
+  厚度、厚度 σ、封闭环方向、单次成本，同一规格可重复使用）；
+  `maintainable_cycles` 必须是研究计算节点的子集；每次维护动作计一次
+  `downtime_cost` 停机成本；`criterion` 选违规判据（极值界或 RSS ±3σ 界）。
+* 系统以三种贪心策略（最低成本 / 垫片优先 / 更换优先）加零动作现状
+  方案生成候选：逐节点检查，违规且可维护时按策略选**单个动作**——
+  **加垫片**（封闭环均值永久平移 sign×厚度，厚度 σ 自加入节点起计入）
+  或**更换零件**（该尺寸累计磨损清零、自更换节点重新计循环并抽新速率，
+  新速率子流只取决于第几次更换、与方案无关，方案间可比）；动作在节点
+  循环数处生效（该节点即按维护后状态评估）。
+* 候选按 **全周期违规数（升序）→ 最早越界点（越晚越优，从不越界最优）
+  → 总成本（垫片+更换+停机，升序）** 排列；每个候选给逐节点判据边界、
+  固定种子 MC 复核超差率（制造样本与研究同源）、首次越界分布与成本拆分。
+* `POST /wear-maintenance-searches/{id}/select` 选定一个 rank 并**冻结**
+  （每个编排结果只能选定一次，重复选定或改选 422）：来源基线链、磨损
+  曲线、维护动作与随机种子随结果固化，后续基线变化不改写历史方案。
+
 ## 校验拒绝（HTTP 422）
 
 * 名义值 ≤ 0；下偏差 > 上偏差；正态未给 σ；
@@ -678,6 +769,13 @@ curl -s -X POST localhost:8000/hole-patterns \
   design_dimensions 同时给出或都不给、能力档位 id 重复 / 引用未声明档位 /
   档位组合数超上限、锁定后名义无界（欠约束，指出工序与自由度）、锁定边
   不属于方案或锁定毛坯边、反算结果重复选定 / 改选、选定 rank 超出候选数。
+* 服役磨损研究：磨损参数漏填 / 链外 / 重复尺寸、磨损曲线首段不从
+  (0, 0) 出发、分段折点不衔接、段内循环数不增或累计磨损下降、速率σ
+  为负、共用载荷相关引用未知尺寸 / 重复声明 / 矩阵非半正定、计算节点
+  非严格递增或超出曲线覆盖范围、封闭环限值缺失或下限 ≥ 上限；
+* 维护编排：锁定件与更换成本重叠、锁定 / 更换引用链外尺寸、维护节点
+  不是研究计算节点子集、垫片 id 重复、成本为负、编排结果重复选定 /
+  改选、选定 rank 超出候选数。
 
 ## 测试
 
@@ -685,7 +783,7 @@ curl -s -X POST localhost:8000/hole-patterns \
 .venv/bin/python -m pytest -q
 ```
 
-178 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
+299 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
 WC/RSS 手算值核对、相关系数对 σ_C 的方向性影响、copula 蒙特卡洛、
 种子可复现性、方案分支不覆盖基线、批量调整与成本搜索、检验批次统计、
 测量方案合成不确定度手算核对、方案校验拒收（缺覆盖因子/负分量/
@@ -711,4 +809,10 @@ GET 不变；热整改方案的材料 / 垫片 / 装配基准温度重基准化�
 不改写；以及三项统计回归——热态制造波动只缩放一次
 （scale=2 时组合 σ 等于制造分量而非其两倍）、全边界安全时
 first_spec_breach 为 null 且不出现空 breach_side、分量超差率在热态
-名义间隙叠加单项偏差后判定（基准 reject_reference_gap_mm）。
+名义间隙叠加单项偏差后判定（基准 reject_reference_gap_mm）；
+服役磨损研究的节点 0 与基线一致、分段线性插值与方向符号、
+σ_wear=速率σ×N、共用载荷相关对消/放大（2r²N²(1−ρ)）、MC 与 RSS
+同源、首次越界分布计数闭合、逐尺寸贡献占比求和为 1、曲线不衔接 /
+节点越界 / 非半正定等拒收、维护编排的锁定-更换矛盾 / 维护节点子集 /
+垫片恢复合规 / 更换清零重计 / 停机成本拆分 / 违规数-越界点-成本排序、
+选定冻结与不可改选、研究重复读取不变且基线链不被改写。

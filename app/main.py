@@ -93,6 +93,14 @@ from .schemas import (
 )
 from .thermal import ThermalError, analyze as thermal_analyze, build_model, search_proposals
 from .units import to_mm
+from .wear import WearError
+from .wear import analyze as wear_analyze, build_model as build_wear_model
+from .wear import model_snapshot as wear_model_snapshot, search_maintenance
+from .wear_schemas import (
+    MaintenanceSearchRequest,
+    MaintenanceSelectRequest,
+    WearStudyCreate,
+)
 
 
 @asynccontextmanager
@@ -2054,4 +2062,232 @@ def select_hole_remedy(remedy_id: int, payload: RemedySelectRequest) -> dict:
         "frozen_remedy": bool(saved_remedy.frozen),
         "freeze_note": "已冻结输入孔系、匹配关系与随机种子；历史版本不改写",
     }
+    return answer
+
+
+# -------------------------------------------------------- 服役磨损研究
+
+def _wear_study_response(row) -> dict:
+    return {
+        "study_id": row.id,
+        "chain_id": row.chain_id,
+        "name": row.name,
+        "note": row.note,
+        "frozen": bool(row.frozen),
+        "mc_samples": row.mc_samples,
+        "random_seed": row.random_seed,
+        "created_at": row.created_at.isoformat(),
+        "baseline_preserved": True,
+        "submitted_input": row.request_json,
+        "model": row.model_json,
+        "result": row.result_json,
+    }
+
+
+@app.post("/chains/{chain_id}/wear-studies", status_code=201, tags=["wear"])
+def create_wear_study(chain_id: int, payload: WearStudyCreate) -> dict:
+    """从冻结基线链建立服役磨损研究（独立成版，创建即冻结）。
+
+    逐尺寸填写磨损方向（增大/减小）、分段线性累计磨损曲线（首段从
+    (0,0) 出发、相邻段折点衔接）与磨损速率标准差；共用载荷导致的速率
+    相关用相关矩阵声明。计算节点为严格递增的循环数序列，不得超出任何
+    尺寸曲线覆盖范围；研究封闭环限值独立设置（至少给一侧）。漏填/链外
+    尺寸、曲线不衔接、相关矩阵非半正定、节点越界均拒绝（422）。
+
+    每个节点叠加初始制造散布（基线分布与相关）与累计磨损（随机速率
+    模型：σ(N)=速率σ×N），给出极值界、RSS、固定种子蒙特卡洛超差率、
+    首次越界循环分布与逐尺寸方差贡献。基线链不变，结果与种子随研究
+    冻结（同一研究重复计算不变）。
+    """
+    chain_row = _load_chain(chain_id)
+    nc = rebuild_normalized(chain_row.request_json)
+    try:
+        model = build_wear_model(nc, payload)
+        result = wear_analyze(model)
+    except WearError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    snapshot = wear_model_snapshot(model)
+    result = {
+        **result,
+        "closure_spec_mm": {
+            "lower_limit": model.lsl,
+            "upper_limit": model.usl,
+            "original": {
+                "lower_limit": payload.closure_lower_limit,
+                "upper_limit": payload.closure_upper_limit,
+                "unit": payload.closure_unit.value,
+            },
+        },
+        "traceability": {
+            "baseline_chain_id": chain_id,
+            "baseline_chain_name": chain_row.name,
+            "baseline_normalized_inputs":
+                chain_row.result_json["normalized_inputs"],
+            "formula": "C(N) = C(0) + Σ s_i·d_i·[μ_i(N) + σ_ri·N·Z_i]",
+            "wear_model": (
+                "随机速率模型：同一零件整个服役期速率偏差恒定，N 循环后"
+                "累计磨损标准差 = 速率σ × N；μ_i(N) 为分段线性累计磨损"
+                "曲线插值；d_i=±1 为磨损方向，s_i 为闭环方向系数"),
+            "uncertainty_sources": [
+                "初始制造散布：基线链分布/相关原样复用（复用基线抽样器）",
+                "磨损速率：σ_ri 按共用载荷相关矩阵相关传播（Cholesky）",
+            ],
+            "worst_case_convention":
+                "制造散布取公差带线性累加 ΣT_i；磨损不确定度按 ±3σ 扩展",
+            "monte_carlo": {
+                "samples": model.mc_samples,
+                "seed": model.seed,
+                "substreams":
+                    "SeedSequence([seed, 0x77656172]).spawn(2)："
+                    "制造散布 / 磨损速率；所有计算节点共用同一组样本"
+                    "（同一批零件），首次越界按样本逐节点扫描",
+            },
+            "frozen_baseline":
+                "基线链规范化输入、磨损曲线、计算节点与随机种子随研究冻结；"
+                "后续基线变化不改写本研究结果",
+        },
+    }
+    study_id = db.save_wear_study(
+        chain_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), snapshot, result,
+        payload.mc_samples, payload.random_seed)
+    return _wear_study_response(db.get_wear_study(study_id))
+
+
+@app.get("/chains/{chain_id}/wear-studies", tags=["wear"])
+def list_wear_studies(chain_id: int) -> dict:
+    _load_chain(chain_id)
+    return {"chain_id": chain_id, "studies": db.list_wear_studies(chain_id)}
+
+
+def _load_wear_study(study_id: int):
+    row = db.get_wear_study(study_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"磨损研究 {study_id} 不存在")
+    return row
+
+
+@app.get("/wear-studies/{study_id}", tags=["wear"])
+def get_wear_study(study_id: int) -> dict:
+    """读取冻结磨损研究：结果创建时固化，重复读取/计算内容不变。"""
+    return _wear_study_response(_load_wear_study(study_id))
+
+
+def _rebuild_wear_model(study_row):
+    """从冻结研究快照重建磨损模型（基线链只读，规则原样重放）。"""
+    chain_row = _load_chain(study_row.chain_id)
+    nc = rebuild_normalized(chain_row.request_json)
+    payload = WearStudyCreate.model_validate(study_row.request_json)
+    return build_wear_model(nc, payload)
+
+
+def _wear_maintenance_payload(row) -> dict:
+    return {
+        "search_id": row.id,
+        "study_id": row.study_id,
+        "chain_id": row.chain_id,
+        "name": row.name,
+        "note": row.note,
+        "frozen": bool(row.frozen),
+        "selected_rank": row.selected_rank,
+        "selected_note": row.selected_note,
+        "created_at": row.created_at.isoformat(),
+        "submitted_input": row.request_json,
+        "result": row.result_json,
+    }
+
+
+@app.post("/wear-studies/{study_id}/maintenance-searches", status_code=201,
+          tags=["wear"])
+def create_maintenance_search(study_id: int,
+                              payload: MaintenanceSearchRequest) -> dict:
+    """维护编排搜索：继续使用 / 加垫片 / 更换零件方案生成与排列。
+
+    锁定件（locked_dimensions）不可更换；replacement_costs 列出可更换件
+    的单次更换成本；每次维护动作计一次停机成本；维护节点必须是研究
+    计算节点的子集。系统以三种贪心策略（最低成本 / 垫片优先 / 更换
+    优先）生成方案并附零动作现状方案，按判据（极值界或 RSS ±3σ 界）
+    统计全周期违规数，候选共用研究同源固定种子蒙特卡洛复核，按
+    「全周期违规数 → 最早越界点（晚者优先）→ 总成本」升序排列。
+    候选表与种子随结果冻结。
+    """
+    study_row = _load_wear_study(study_id)
+    model = _rebuild_wear_model(study_row)
+    try:
+        result = search_maintenance(model, payload)
+    except WearError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    seed = (model.seed if payload.random_seed is None
+            else payload.random_seed)
+    result = {
+        **result,
+        "study_id": study_id,
+        "chain_id": study_row.chain_id,
+        "frozen_inputs": {
+            "baseline_chain_id": study_row.chain_id,
+            "wear_study_id": study_id,
+            "wear_study_seed": study_row.random_seed,
+            "wear_model_snapshot": "磨损曲线 / 计算节点 / 封闭环限值引用"
+                                   "冻结研究快照",
+            "candidate_table": payload.model_dump(mode="json"),
+            "random_seed": seed,
+        },
+    }
+    search_id = db.save_wear_maintenance(
+        study_id, study_row.chain_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), result)
+    return _wear_maintenance_payload(db.get_wear_maintenance(search_id))
+
+
+@app.get("/wear-studies/{study_id}/maintenance-searches", tags=["wear"])
+def list_maintenance_searches(study_id: int) -> dict:
+    _load_wear_study(study_id)
+    return {"study_id": study_id,
+            "searches": db.list_wear_maintenances(study_id)}
+
+
+@app.get("/wear-maintenance-searches/{search_id}", tags=["wear"])
+def get_maintenance_search(search_id: int) -> dict:
+    """读取维护编排搜索结果（选定前可重看候选；选定后结果不可改）。"""
+    row = db.get_wear_maintenance(search_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"维护编排结果 {search_id} 不存在")
+    return _wear_maintenance_payload(row)
+
+
+@app.post("/wear-maintenance-searches/{search_id}/select", tags=["wear"])
+def select_maintenance_plan(search_id: int,
+                            payload: MaintenanceSelectRequest) -> dict:
+    """选定一个维护方案并冻结：固化来源链、磨损曲线、维护动作与随机种子。
+
+    每个编排结果只能选定一次（重复选定或改选返回 422）；历史方案不改写，
+    后续基线链变化不影响已冻结结果。
+    """
+    row = db.get_wear_maintenance(search_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"维护编排结果 {search_id} 不存在")
+    if row.frozen:
+        raise HTTPException(
+            status_code=422,
+            detail=f"维护编排结果 {search_id} 已选定方案 rank="
+                   f"{row.selected_rank} 并冻结，不能改选；请在冻结研究上"
+                   "另建编排搜索")
+    candidates = row.result_json.get("candidates", [])
+    if payload.rank > len(candidates):
+        raise HTTPException(
+            status_code=422,
+            detail=f"rank={payload.rank} 超出候选数 {len(candidates)}")
+    db.freeze_wear_maintenance(search_id, payload.rank, payload.note)
+    saved = db.get_wear_maintenance(search_id)
+    answer = _wear_maintenance_payload(saved)
+    chosen = next(c for c in saved.result_json["candidates"]
+                  if c["rank"] == payload.rank)
+    answer["selected_candidate"] = chosen
+    answer["freeze_note"] = (
+        "已冻结来源基线链、磨损曲线、维护动作与随机种子；后续基线变化"
+        "不改写本方案。后续维护执行应引用本编排结果与研究快照。")
     return answer

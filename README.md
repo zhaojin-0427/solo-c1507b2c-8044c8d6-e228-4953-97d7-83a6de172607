@@ -120,6 +120,10 @@ python3 -m venv --without-pip .venv        # 若 venv 自带 pip 可省略 get-p
 | POST | `/wear-studies/{sid}/maintenance-searches` | 维护编排搜索（继续使用/加垫片/更换零件，按违规数→最早越界点→总成本排列） |
 | GET | `/wear-studies/{sid}/maintenance-searches` / `/wear-maintenance-searches/{mid}` | 编排结果列表 / 冻结详情 |
 | POST | `/wear-maintenance-searches/{mid}/select` | 选定维护方案并冻结（来源链/磨损曲线/维护动作/种子固化，只能选一次） |
+| POST | `/chains/{id}/drift-studies` | 建立**检验批次漂移研究**（同链多冻结批次按采样时刻成序；关注尺寸/封闭环的单侧或双侧 CUSUM、EWMA + 最小样本量/阈值） |
+| GET | `/chains/{id}/drift-studies` / `/drift-studies/{sid}` | 漂移研究列表 / 读取冻结研究（来源批次、参数、结果创建时固化） |
+| POST | `/drift-studies/{sid}/copy` | 复制研究，逐批注明原因排除异常批次，比较排除前后报警/变点结论（父研究不变） |
+| POST | `/drift-studies/{sid}/finalize` | 定稿冻结来源批次、算法参数与计算结果（定稿后不得复制/改写，后续检验数据不影响） |
 
 ## 典型流程
 
@@ -169,6 +173,16 @@ curl -s -X POST localhost:8000/wear-studies/1/maintenance-searches \
   -H 'Content-Type: application/json' -d @examples/wear_maintenance.json
 curl -s -X POST localhost:8000/wear-maintenance-searches/1/select \
   -H 'Content-Type: application/json' -d '{"rank":1,"note":"采纳最低成本方案"}'
+
+# 10) 检验批次漂移研究：同链多个冻结批次按采样时刻成序（CUSUM / EWMA），
+#     复制研究排除异常批次并比较，评审通过后定稿冻结
+curl -s -X POST localhost:8000/chains/1/drift-studies \
+  -H 'Content-Type: application/json' -d @examples/drift_study.json
+curl -s -X POST localhost:8000/drift-studies/1/copy \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"排除异常批后","exclusions":[{"batch_id":4,"reason":"换模首批，工艺未稳定"}]}'
+curl -s -X POST localhost:8000/drift-studies/1/finalize \
+  -H 'Content-Type: application/json' -d '{"note":"季度来料评审定稿"}'
 ```
 
 ### 成本模型
@@ -740,6 +754,63 @@ curl -s -X POST localhost:8000/wear-maintenance-searches/1/select \
   （每个编排结果只能选定一次，重复选定或改选 422）：来源基线链、磨损
   曲线、维护动作与随机种子随结果固化，后续基线变化不改写历史方案。
 
+## 检验批次漂移研究（CUSUM / EWMA）
+
+漂移研究把**同一基线链的多个冻结来料检验批次**组成独立版本，并为每批
+指定采样时刻（示例 `examples/drift_study.json`），按时间顺序对关注尺寸
+与封闭环做 SPC 漂移监控：
+
+```bash
+curl -s -X POST localhost:8000/chains/1/drift-studies \
+  -H 'Content-Type: application/json' -d @examples/drift_study.json
+```
+
+* **来源校验**：批次必须存在、同属该基线链、不重复；`sampled_at` 必须
+  严格递增（逆序 / 同时刻拒收），全研究统一带时区或统一不带时区；至少
+  2 个批次；至少一个监控目标（`dimensions` 关注尺寸或 `monitor_closure`
+  封闭环），链外尺寸与重复关注尺寸拒收。
+* **参数**：研究级缺省 `defaults`（`sidedness` 双侧 / 仅上侧 / 仅下侧、
+  CUSUM `cusum_k`/`cusum_h`、EWMA `ewma_lambda`/`ewma_L`、`min_sample_size`），
+  每个目标可用 `overrides` 逐目标覆盖。k、h、L 为正，0<λ≤1。
+
+### 统计口径
+
+| 量 | 公式 |
+|---|---|
+| 在控均值 μ0 | 尺寸：制程中心 N+(ES+EI)/2；封闭环：基线 RSS 均值 μ_C |
+| 在控标准差 σ0 | 尺寸：基线 RSS 逐尺寸 σ；封闭环：基线 RSS σ_C |
+| 批次标准误 | SE_t = √(σ0²/n_t + u_g,t²)；z_t = (x̄_t − μ0)/SE_t |
+| CUSUM | C+_t=max(0, C+_{t-1}+z_t−k)，C−_t=max(0, C−_{t-1}−z_t−k)，越过 h 报警 |
+| EWMA | q_t=λ·z_t+(1−λ)·q_{t-1}，q_0=0；限 ±L·√(λ/(2−λ)·(1−(1−λ)^{2t})) |
+
+逐批返回批次均值、样本标准差、对 μ0 的偏移、标准误（拆分抽样分量
+σ0/√n 与量具批次分量 u_g）、z 值，以及两种图的统计量、**阈值余量**
+（CUSUM：h−C±；EWMA：限−|q|，≤0 即已报警）、漂移方向、首次报警批次
+与估计变点（CUSUM 取报警轮连续累计起点；EWMA 取累积标准化残差谷底；
+偏移量为变点后批次 z 值平均，σ0 单位）。研究级结论取所有目标中最早的
+首次报警。有效样本不足 `min_sample_size` 的批次跳过作图并列入
+`insufficient_batches`；可作图批次 < 2 时只给逐批统计、不判报警。
+
+**量具不确定度传播**：来源批次引用测量方案时，先按方案做偏倚修正
+（x_c=x+b）再算批次均值；校准/偏倚/重复性等共用量具公共误差源
+（u_rest，不随 n 缩小）计入批次标准误，逐尺寸扩展不确定度用方案覆盖
+因子 k_i；封闭环按 GUM 相关传播
+u_g,C²=Σ_iΣ_j s_i·s_j·ρ_ij·u_rest,i·u_rest,j，扩展不确定度用批次
+k_out（默认 2）。封闭环另给**各尺寸对封闭环漂移的带符号贡献**
+s_i·(x̄_i,末批 − x̄_i,首批) 与占比。部分批次未引用方案时按零量具系统
+误差处理并给出口径不一致告警。
+
+### 复制排除与定稿
+
+* `POST /drift-studies/{id}/copy`：复制研究并逐批注明原因排除异常批次
+  （原因必填；排除对象必须是父研究来源批次；排除后至少保留 2 批）。
+  副本与父研究同链、同算法参数，只重放剩余批次；父研究保持不变，副本
+  附 `comparison_with_parent`，逐目标比较报警是否消失/新增、首次报警
+  批次与变点是否改变、最新偏移量。
+* `POST /drift-studies/{id}/finalize`：**定稿**后冻结来源批次、算法参数
+  与计算结果（重复定稿 422），不得再复制排除；后续检验数据（新批次、
+  测量方案新版本）不改写已定稿研究。
+
 ## 校验拒绝（HTTP 422）
 
 * 名义值 ≤ 0；下偏差 > 上偏差；正态未给 σ；
@@ -776,6 +847,11 @@ curl -s -X POST localhost:8000/wear-maintenance-searches/1/select \
 * 维护编排：锁定件与更换成本重叠、锁定 / 更换引用链外尺寸、维护节点
   不是研究计算节点子集、垫片 id 重复、成本为负、编排结果重复选定 /
   改选、选定 rank 超出候选数。
+* 检验批次漂移研究：来源批次不存在 / 错链 / 重复列出、少于 2 个批次、
+  采样时刻逆序或同时刻、混用时区口径、无任何监控目标、关注尺寸链外 /
+  重复、CUSUM k/h 或 EWMA L 非正、λ 越界（0<λ≤1）、最小样本量 < 1、
+  复制时排除非父研究来源批次、排除原因空、排除后不足 2 批、对已定稿
+  研究复制或重复定稿（422）。
 
 ## 测试
 
@@ -783,7 +859,7 @@ curl -s -X POST localhost:8000/wear-maintenance-searches/1/select \
 .venv/bin/python -m pytest -q
 ```
 
-299 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
+311 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
 WC/RSS 手算值核对、相关系数对 σ_C 的方向性影响、copula 蒙特卡洛、
 种子可复现性、方案分支不覆盖基线、批量调整与成本搜索、检验批次统计、
 测量方案合成不确定度手算核对、方案校验拒收（缺覆盖因子/负分量/
@@ -815,4 +891,10 @@ first_spec_breach 为 null 且不出现空 breach_side、分量超差率在热�
 同源、首次越界分布计数闭合、逐尺寸贡献占比求和为 1、曲线不衔接 /
 节点越界 / 非半正定等拒收、维护编排的锁定-更换矛盾 / 维护节点子集 /
 垫片恢复合规 / 更换清零重计 / 停机成本拆分 / 违规数-越界点-成本排序、
-选定冻结与不可改选、研究重复读取不变且基线链不被改写。
+选定冻结与不可改选、研究重复读取不变且基线链不被改写；检验批次漂移
+研究的批次归属（不存在 / 错链 / 重复）、采样顺序（逆序 / 同时刻 / 混用
+时区）、目标与参数校验、逐批 z/标准误/阈值余量、单侧图只维护对应一侧、
+CUSUM/EWMA 首次报警批次方向与变点、最小样本量剔除、量具偏倚修正与
+u_g 计入标准误、封闭环 GUM 传播手算核对、各尺寸封闭环漂移带符号贡献、
+复制排除后报警消失与前后结论比较、定稿后不可复制 / 重复定稿、研究
+快照重复 GET 不变。

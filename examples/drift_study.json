@@ -1,0 +1,39 @@
+{
+  "name": "2026-供应商A-季度漂移研究",
+  "note": "6 个冻结来料批次按采样时刻成序；L1 用双侧 CUSUM/EWMA，封闭环同图",
+  "batches": [
+    {"batch_id": 1, "sampled_at": "2026-01-05T08:00:00+00:00", "note": "1 月批"},
+    {"batch_id": 2, "sampled_at": "2026-02-02T08:00:00+00:00"},
+    {"batch_id": 3, "sampled_at": "2026-03-02T08:00:00+00:00"},
+    {"batch_id": 4, "sampled_at": "2026-04-06T08:00:00+00:00", "note": "换模首批"},
+    {"batch_id": 5, "sampled_at": "2026-05-04T08:00:00+00:00"},
+    {"batch_id": 6, "sampled_at": "2026-06-01T08:00:00+00:00"}
+  ],
+  "dimensions": [
+    {"dimension_id": "L1", "overrides": {
+      "sidedness": "two_sided",
+      "cusum_k": 0.5,
+      "cusum_h": 5.0,
+      "ewma_lambda": 0.2,
+      "ewma_L": 3.0,
+      "min_sample_size": 10
+    }}
+  ],
+  "monitor_closure": true,
+  "closure_overrides": {
+    "sidedness": "two_sided",
+    "cusum_k": 0.5,
+    "cusum_h": 5.0,
+    "ewma_lambda": 0.2,
+    "ewma_L": 3.0,
+    "min_sample_size": 10
+  },
+  "defaults": {
+    "sidedness": "two_sided",
+    "cusum_k": 0.5,
+    "cusum_h": 5.0,
+    "ewma_lambda": 0.2,
+    "ewma_L": 3.0,
+    "min_sample_size": 10
+  }
+}

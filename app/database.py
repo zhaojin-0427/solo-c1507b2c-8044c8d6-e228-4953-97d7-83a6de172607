@@ -16,6 +16,7 @@
 * hole_remedies      孔系整改搜索结果（候选钻孔/连接件/孔位修正；采纳后冻结）
 * wear_studies       服役磨损研究（冻结基线链上的磨损曲线/节点/限值，冻结）
 * wear_maintenances  磨损维护编排搜索结果（继续/垫片/更换方案；选定后冻结）
+* drift_studies      检验批次漂移研究（多冻结批次时序 + CUSUM/EWMA；定稿后冻结）
 """
 from __future__ import annotations
 
@@ -448,6 +449,37 @@ class WearMaintenanceRow(Base):
     selected_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
     selected_note: Mapped[str] = mapped_column(Text, default="")
     frozen: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class DriftStudyRow(Base):
+    """检验批次漂移研究：来源批次 / 算法参数 / 逐批结果创建时固化。
+
+    frozen=0 时为可派生排除版本的草案；finalize 置 frozen=1 后研究定稿，
+    不得再复制或改写（历史检验数据更新同样不改写本研究）。
+    """
+
+    __tablename__ = "drift_studies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(
+        ForeignKey("chains.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    # 原始请求（批次 id + 采样时刻 / 目标 / 参数缺省与覆盖原样冻结）
+    request_json: Mapped[dict] = mapped_column(JSON)
+    # 创建时一次性算好的 CUSUM / EWMA 逐批结果
+    result_json: Mapped[dict] = mapped_column(JSON)
+    # 排除的来源批次（普通研究为空；复制研究记录 {batch_id, reason}）
+    exclusions_json: Mapped[list] = mapped_column(JSON, default=list)
+    parent_study_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True)
+    version_no: Mapped[int] = mapped_column(Integer, default=1)
+    frozen: Mapped[int] = mapped_column(Integer, default=0)
+    finalized_note: Mapped[str] = mapped_column(Text, default="")
+    finalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
@@ -1450,4 +1482,68 @@ def freeze_wear_maintenance(search_id: int, rank: int, note: str) -> None:
         row.selected_rank = rank
         row.selected_note = note
         row.frozen = 1
+        s.commit()
+
+
+# ------------------------------------------------------- 检验批次漂移研究 CRUD
+
+def save_drift_study(chain_id: int, name: str, note: str, request: dict,
+                     result: dict, exclusions: list[dict],
+                     parent_study_id: int | None, version_no: int,
+                     frozen: int = 0) -> int:
+    with session_factory() as s:
+        row = DriftStudyRow(
+            chain_id=chain_id, name=name, note=note,
+            request_json=request, result_json=result,
+            exclusions_json=exclusions, parent_study_id=parent_study_id,
+            version_no=version_no, frozen=frozen,
+        )
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def get_drift_study(study_id: int) -> DriftStudyRow | None:
+    with session_factory() as s:
+        row = s.get(DriftStudyRow, study_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_drift_studies(chain_id: int) -> list[dict]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(DriftStudyRow)
+            .where(DriftStudyRow.chain_id == chain_id)
+            .order_by(DriftStudyRow.id)
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "chain_id": r.chain_id,
+                "name": r.name,
+                "note": r.note,
+                "version_no": r.version_no,
+                "parent_study_id": r.parent_study_id,
+                "frozen": bool(r.frozen),
+                "batch_count": len(r.request_json["batches"]),
+                "excluded_batch_count": len(r.exclusions_json or []),
+                "any_alarm": r.result_json["conclusion"]["any_alarm"],
+                "first_alarm": r.result_json["conclusion"]["first_alarm"],
+                "created_at": r.created_at.isoformat(),
+                "finalized_at": (r.finalized_at.isoformat()
+                                 if r.finalized_at else None),
+            }
+            for r in rows
+        ]
+
+
+def freeze_drift_study(study_id: int, note: str) -> None:
+    """定稿：写入定稿备注与时间并置 frozen=1（调用方保证只定稿一次）。"""
+    with session_factory() as s:
+        row = s.get(DriftStudyRow, study_id)
+        row.frozen = 1
+        row.finalized_note = note
+        row.finalized_at = _utcnow()
         s.commit()

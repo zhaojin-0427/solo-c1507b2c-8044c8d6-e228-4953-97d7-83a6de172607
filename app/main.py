@@ -64,6 +64,13 @@ from .holes import (
     model_snapshot as hole_model_snapshot,
 )
 from .inspection import analyze_batch, baseline_comparison, validate_rows
+from .drift import DriftError, compare_results as compare_drift_results
+from .drift import run_study as run_drift_study
+from .drift_schemas import (
+    DriftStudyCopyRequest,
+    DriftStudyCreate,
+    DriftStudyFinalizeRequest,
+)
 from .measurement import evaluate_batch, normalize_plan
 from .optimizer import search_cost_targets
 from .scenarios import (
@@ -2290,4 +2297,235 @@ def select_maintenance_plan(search_id: int,
     answer["freeze_note"] = (
         "已冻结来源基线链、磨损曲线、维护动作与随机种子；后续基线变化"
         "不改写本方案。后续维护执行应引用本编排结果与研究快照。")
+    return answer
+
+
+# -------------------------------------------------------- 检验批次漂移研究
+
+def _drift_study_payload(row, *, comparison: dict | None = None) -> dict:
+    return {
+        "study_id": row.id,
+        "chain_id": row.chain_id,
+        "name": row.name,
+        "note": row.note,
+        "version_no": row.version_no,
+        "parent_study_id": row.parent_study_id,
+        "frozen": bool(row.frozen),
+        "finalized_note": row.finalized_note or None,
+        "finalized_at": (row.finalized_at.isoformat()
+                         if row.finalized_at else None),
+        "exclusions": row.exclusions_json or [],
+        "created_at": row.created_at.isoformat(),
+        "submitted_input": row.request_json,
+        "result": row.result_json,
+        **({"comparison_with_parent": comparison} if comparison else {}),
+    }
+
+
+def _load_drift_batches(chain_id: int, batch_ids: list[int]):
+    """按给定顺序取冻结批次，复核存在与同链（重复由 Pydantic 拦截）。"""
+    rows = []
+    problems = []
+    for bid in batch_ids:
+        brow = db.get_inspection_batch(bid)
+        if brow is None:
+            raise HTTPException(
+                status_code=404, detail=f"检验批次 {bid} 不存在")
+        if brow.chain_id != chain_id:
+            problems.append(
+                f"批次 {bid} 属于链 {brow.chain_id}，不属于当前链 {chain_id}")
+        rows.append(brow)
+    if problems:
+        raise HTTPException(status_code=422, detail="；".join(problems))
+    return rows
+
+
+def _sampled_at_iso(payload: DriftStudyCreate) -> dict[int, str]:
+    return {b.batch_id: b.sampled_at.isoformat() for b in payload.batches}
+
+
+@app.post("/chains/{chain_id}/drift-studies", status_code=201,
+          tags=["drift"])
+def create_drift_study(chain_id: int, payload: DriftStudyCreate) -> dict:
+    """建立检验批次漂移研究：同一基线链的多个冻结批次按采样时刻成序。
+
+    每个来源批次指定采样时刻（必须严格递增、不得同时刻或逆序、不得混用
+    时区口径）；为关注尺寸和/或封闭环设置单侧或双侧标准化 CUSUM
+    （k、h）、EWMA（λ、L）、最小样本量与报警阈值（研究级缺省 + 逐目标
+    覆盖）。批次不存在 / 错链 / 重复、采样顺序错误、目标链外或无任何
+    监控目标时拒绝（422/404）。
+    系统逐批返回批次均值、标准误（含量具批次级系统误差）、标准化 z、
+    CUSUM/EWMA 统计量与阈值余量、漂移方向、首次报警批次与估计变点；
+    来源批次引用测量方案时先做偏倚修正并传播量具不确定度，封闭环另给
+    各尺寸对其漂移的带符号贡献。研究创建即固化来源批次、算法参数与
+    计算结果（草案，可复制排除），定稿后不得再改写。
+    """
+    chain_row = _load_chain(chain_id)
+    nc = rebuild_normalized(chain_row.request_json)
+
+    # 链外尺寸在引擎外先做一次显式复核（给出清晰 422）
+    chain_ids = {d.id for d in nc.dimensions}
+    external = sorted({d.dimension_id for d in payload.dimensions
+                       if d.dimension_id not in chain_ids})
+    if external:
+        raise HTTPException(
+            status_code=422,
+            detail=f"关注尺寸不在基线链 {chain_id} 上（未知尺寸）: "
+                   f"{external}；链上尺寸: {sorted(chain_ids)}")
+
+    batch_rows = _load_drift_batches(
+        chain_id, [b.batch_id for b in payload.batches])
+    try:
+        result = run_drift_study(
+            nc, chain_row.result_json, batch_rows, payload,
+            _sampled_at_iso(payload))
+    except DriftError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    result["frozen_inputs"] = {
+        "baseline_chain_id": chain_id,
+        "source_batches": [
+            {"batch_id": b.batch_id, "sampled_at": b.sampled_at.isoformat(),
+             "note": b.note} for b in payload.batches],
+        "algorithm": "standardized tabular CUSUM + EWMA（参数逐目标冻结）",
+        "measurement_policy": "引用测量方案的批次按方案偏倚修正后计算；"
+                              "量具批次级系统误差 u_rest 计入标准误，"
+                              "封闭环按 GUM 相关传播",
+    }
+    study_id = db.save_drift_study(
+        chain_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), result,
+        exclusions=[], parent_study_id=None, version_no=1)
+    saved = db.get_drift_study(study_id)
+    return _drift_study_payload(saved)
+
+
+@app.get("/chains/{chain_id}/drift-studies", tags=["drift"])
+def list_drift_studies(chain_id: int) -> dict:
+    _load_chain(chain_id)
+    return {"chain_id": chain_id, "studies": db.list_drift_studies(chain_id)}
+
+
+def _load_drift_study(study_id: int):
+    row = db.get_drift_study(study_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"漂移研究 {study_id} 不存在")
+    return row
+
+
+@app.get("/drift-studies/{study_id}", tags=["drift"])
+def get_drift_study(study_id: int) -> dict:
+    """读取漂移研究快照：来源批次、参数与结果创建时固化，重复读取不变。"""
+    return _drift_study_payload(_load_drift_study(study_id))
+
+
+@app.post("/drift-studies/{study_id}/copy", status_code=201, tags=["drift"])
+def copy_drift_study(study_id: int,
+                     payload: DriftStudyCopyRequest) -> dict:
+    """复制研究：可逐批注明原因排除异常批次，比较排除前后结论。
+
+    父研究必须尚未定稿（定稿后 422）；排除对象必须是父研究来源批次且
+    原因非空，排除后至少保留 2 个批次（控制图需要时间序列）。副本与
+    父研究同链、同算法参数，只重放剩余批次；父研究保持不变，副本结果
+    中附 comparison_with_parent（报警方向、首次报警批次、估计变点、
+    最新偏移逐项对比）。副本同样创建即冻结，可继续复制或定稿。
+    """
+    parent = _load_drift_study(study_id)
+    if parent.frozen:
+        raise HTTPException(
+            status_code=422,
+            detail=f"漂移研究 {study_id} 已定稿冻结（来源批次、算法参数与"
+                   "计算结果不可改写），不能再复制排除版本")
+    chain_row = _load_chain(parent.chain_id)
+    nc = rebuild_normalized(chain_row.request_json)
+
+    req = parent.request_json
+    source_specs = req["batches"]
+    source_ids = [b["batch_id"] for b in source_specs]
+    excluded = {e.batch_id: e.reason for e in payload.exclusions}
+    unknown = sorted(set(excluded) - set(source_ids))
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"排除批次 {unknown} 不在父研究 {study_id} 的来源批次中；"
+                   f"父研究来源批次: {source_ids}")
+    remaining_specs = [b for b in source_specs
+                       if b["batch_id"] not in excluded]
+    if len(remaining_specs) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail=f"排除后仅剩 {len(remaining_specs)} 个批次："
+                   "CUSUM/EWMA 至少需要 2 个按采样时刻有序的批次")
+
+    from .drift_schemas import DriftBatchSpec
+
+    new_payload = DriftStudyCreate(
+        name=payload.name or f"{parent.name}-复制",
+        note=payload.note,
+        batches=[
+            DriftBatchSpec(batch_id=b["batch_id"],
+                           sampled_at=b["sampled_at"],
+                           note=b.get("note", ""))
+            for b in remaining_specs],
+        dimensions=req["dimensions"],
+        monitor_closure=bool(req.get("monitor_closure", False)),
+        closure_overrides=req.get("closure_overrides"),
+        defaults=req["defaults"],
+    )
+    batch_rows = _load_drift_batches(
+        parent.chain_id, [b["batch_id"] for b in remaining_specs])
+    try:
+        result = run_drift_study(
+            nc, chain_row.result_json, batch_rows, new_payload,
+            _sampled_at_iso(new_payload))
+    except DriftError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    exclusions_store = [
+        {"batch_id": bid, "reason": reason}
+        for bid, reason in excluded.items()]
+    result["copied_from"] = {
+        "parent_study_id": parent.id,
+        "parent_name": parent.name,
+        "excluded_batches": exclusions_store,
+    }
+    result["frozen_inputs"] = {
+        **parent.result_json.get("frozen_inputs", {}),
+        "copied_from_study_id": parent.id,
+    }
+    new_no = parent.version_no + 1
+    new_id = db.save_drift_study(
+        parent.chain_id, new_payload.name, payload.note,
+        new_payload.model_dump(mode="json"), result,
+        exclusions=exclusions_store, parent_study_id=parent.id,
+        version_no=new_no)
+    comparison = compare_drift_results(parent.result_json, result)
+    comparison["parent_study_id"] = parent.id
+    comparison["copied_study_id"] = new_id
+    saved = db.get_drift_study(new_id)
+    return _drift_study_payload(saved, comparison=comparison)
+
+
+@app.post("/drift-studies/{study_id}/finalize", tags=["drift"])
+def finalize_drift_study(study_id: int,
+                         payload: DriftStudyFinalizeRequest) -> dict:
+    """定稿漂移研究：冻结来源批次、算法参数与计算结果。
+
+    定稿幂等于同一状态：已定稿再次定稿返回 422；定稿后不可复制排除、
+    不可改写，后续检验数据（新批次 / 测量方案新版本）不影响本研究。
+    """
+    row = _load_drift_study(study_id)
+    if row.frozen:
+        raise HTTPException(
+            status_code=422,
+            detail=f"漂移研究 {study_id} 已定稿冻结，不能重复定稿；"
+                   "定稿时间 "
+                   + (row.finalized_at.isoformat() if row.finalized_at else ""))
+    db.freeze_drift_study(study_id, payload.note)
+    saved = db.get_drift_study(study_id)
+    answer = _drift_study_payload(saved)
+    answer["freeze_note"] = (
+        "已冻结来源批次、算法参数与计算结果；后续检验数据不得改写本研究，"
+        "定稿研究也不能再派生排除版本（如需排除异常批次请在定稿前复制）")
     return answer

@@ -413,6 +413,12 @@ class MeasurementPlanCreate(BaseModel):
         description="尺寸 id -> 冻结量具 R&R 研究 id；该尺寸的重复性分量"
                     "以研究的总量具标准差取代手填值",
     )
+    linearity_studies: dict[str, int] = Field(
+        default_factory=dict,
+        description="尺寸 id -> 已采用(adopted)的量具线性与偏倚研究 id；"
+                    "该尺寸按实测值做逆回归线性偏倚修正并传播系数与标准件"
+                    "不确定度（不得再同时给手填 bias_correction/bias_std）",
+    )
 
     @model_validator(mode="after")
     def _check_plan(self) -> "MeasurementPlanCreate":
@@ -423,6 +429,19 @@ class MeasurementPlanCreate(BaseModel):
         bad_ref = {k: v for k, v in self.gage_rr_studies.items() if v < 1}
         if bad_ref:
             raise ValueError(f"量具 R&R 研究 id 必须为正整数: {bad_ref}")
+        bad_lin = {k: v for k, v in self.linearity_studies.items() if v < 1}
+        if bad_lin:
+            raise ValueError(f"线性与偏倚研究 id 必须为正整数: {bad_lin}")
+        gauge_by = {g.dimension_id: g for g in self.gauges}
+        for dim_id in self.linearity_studies:
+            g = gauge_by.get(dim_id)
+            if g is not None and (g.bias_correction is not None
+                                  or g.bias_std_uncertainty is not None):
+                raise ValueError(
+                    f"尺寸 {dim_id} 已引用线性与偏倚研究：偏倚修正由研究的"
+                    "线性模型按实测值给出，不得同时手填 bias_correction / "
+                    "bias_std_uncertainty（其余分辨率 / 校准 / 重复性分量照常填写）"
+                )
         id_set = set(ids)
         seen_pairs: set[frozenset[str]] = set()
         for c in self.correlations:

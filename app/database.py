@@ -17,6 +17,8 @@
 * wear_studies       服役磨损研究（冻结基线链上的磨损曲线/节点/限值，冻结）
 * wear_maintenances  磨损维护编排搜索结果（继续/垫片/更换方案；选定后冻结）
 * drift_studies      检验批次漂移研究（多冻结批次时序 + CUSUM/EWMA；定稿后冻结）
+* linearity_studies  量具线性与偏倚研究（多点有证标准件核查 + 加权拟合；
+                      草稿 draft → 已定稿 finalized → 已采用 adopted，各状态快照）
 """
 from __future__ import annotations
 
@@ -1546,4 +1548,121 @@ def freeze_drift_study(study_id: int, note: str) -> None:
         row.frozen = 1
         row.finalized_note = note
         row.finalized_at = _utcnow()
+        s.commit()
+
+
+# ------------------------------------------------------- 量具线性与偏倚研究 CRUD
+
+class LinearityStudyRow(Base):
+    """量具线性与偏倚研究：一件量具在工作量程内对有证标准件的多点核查。
+
+    状态流转 draft（草稿，可复制排除异常读数）→ finalized（已定稿，不可
+    复制 / 改写）→ adopted（已采用，可接入测量方案做按实测值的线性偏倚
+    修正）。每个状态独立成行快照，源数据 request_json 与结果 result_json
+    在创建时固化；定稿 / 采用只更新状态字段，不改写快照。
+    """
+
+    __tablename__ = "linearity_studies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(
+        ForeignKey("chains.id", ondelete="CASCADE"), index=True
+    )
+    dimension_id: Mapped[str] = mapped_column(String(200), index=True)
+    name: Mapped[str] = mapped_column(String(200), index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="draft", index=True)
+    # 原始请求（核查点 / 标准件 / 读数 / 工作量程原样冻结）与完整结果
+    request_json: Mapped[dict] = mapped_column(JSON)
+    result_json: Mapped[dict] = mapped_column(JSON)
+    # 排除的异常读数（普通研究为空；复制研究记录 {point_id,operator,replicate,reason}）
+    exclusions_json: Mapped[list] = mapped_column(JSON, default=list)
+    parent_study_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True)
+    version_no: Mapped[int] = mapped_column(Integer, default=1)
+    finalized_note: Mapped[str] = mapped_column(Text, default="")
+    adopted_note: Mapped[str] = mapped_column(Text, default="")
+    finalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True)
+    adopted_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+def save_linearity_study(chain_id: int, dimension_id: str, name: str, note: str,
+                         request: dict, result: dict, exclusions: list[dict],
+                         parent_study_id: int | None, version_no: int) -> int:
+    with session_factory() as s:
+        row = LinearityStudyRow(
+            chain_id=chain_id, dimension_id=dimension_id, name=name, note=note,
+            status="draft", request_json=request, result_json=result,
+            exclusions_json=exclusions, parent_study_id=parent_study_id,
+            version_no=version_no,
+        )
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def get_linearity_study(study_id: int) -> LinearityStudyRow | None:
+    with session_factory() as s:
+        row = s.get(LinearityStudyRow, study_id)
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def list_linearity_studies(chain_id: int) -> list[dict]:
+    with session_factory() as s:
+        rows = s.scalars(
+            select(LinearityStudyRow)
+            .where(LinearityStudyRow.chain_id == chain_id)
+            .order_by(LinearityStudyRow.id)
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "chain_id": r.chain_id,
+                "dimension_id": r.dimension_id,
+                "name": r.name,
+                "note": r.note,
+                "status": r.status,
+                "version_no": r.version_no,
+                "parent_study_id": r.parent_study_id,
+                "reference_points": len(r.request_json["points"]),
+                "total_readings": sum(
+                    len(p["readings"]) for p in r.request_json["points"]),
+                "regression_available":
+                    r.result_json["regression_available"],
+                "coverage_adequate":
+                    r.result_json["coverage"]["coverage_adequate"],
+                "adoptable": r.result_json["adoptable"],
+                "slope": (r.result_json.get("regression") or {}).get("slope"),
+                "created_at": r.created_at.isoformat(),
+                "finalized_at": (r.finalized_at.isoformat()
+                                 if r.finalized_at else None),
+                "adopted_at": (r.adopted_at.isoformat()
+                               if r.adopted_at else None),
+            }
+            for r in rows
+        ]
+
+
+def finalize_linearity_study(study_id: int, note: str) -> None:
+    """定稿：状态 draft → finalized（调用方保证状态合法、只定稿一次）。"""
+    with session_factory() as s:
+        row = s.get(LinearityStudyRow, study_id)
+        row.status = "finalized"
+        row.finalized_note = note
+        row.finalized_at = _utcnow()
+        s.commit()
+
+
+def adopt_linearity_study(study_id: int, note: str) -> None:
+    """采用：状态 finalized → adopted（调用方保证研究可采用、只采用一次）。"""
+    with session_factory() as s:
+        row = s.get(LinearityStudyRow, study_id)
+        row.status = "adopted"
+        row.adopted_note = note
+        row.adopted_at = _utcnow()
         s.commit()

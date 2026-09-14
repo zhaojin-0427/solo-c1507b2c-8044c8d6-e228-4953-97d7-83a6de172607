@@ -179,7 +179,17 @@ def build_pools(nc: NormalizedChain, batch_rows: list[Any],
                     m = by_dim[d]
                     x_mm = to_mm(m["value"], m["unit"])
                     pd = plan_by.get(d)
-                    bias = float(pd["bias_correction_mm"]) if pd else 0.0
+                    lin = pd.get("linear_bias_model") if pd else None
+                    if lin is not None:
+                        from .linearity import apply_linear_bias_model
+                        ev = apply_linear_bias_model(lin, x_mm)
+                        bias = float(ev["bias_correction_mm"])
+                        u_lin = float(ev["correction_std_uncertainty_mm"])
+                        in_range = bool(ev["in_applicable_range"])
+                    else:
+                        bias = float(pd["bias_correction_mm"]) if pd else 0.0
+                        u_lin = 0.0
+                        in_range = True
                     corrected[d] = x_mm + bias
                     measured[d] = {
                         "value": m["value"], "unit": m["unit"],
@@ -189,6 +199,8 @@ def build_pools(nc: NormalizedChain, batch_rows: list[Any],
                         "measurement_plan_id": (
                             brow.measurement_plan_id
                             if pd is not None else None),
+                        "linear_bias_std_uncertainty_mm": u_lin,
+                        "in_applicable_range": in_range,
                     }
                     if pd is not None:
                         u_res[j] = pd["components_mm"]["u_resolution"]
@@ -197,11 +209,20 @@ def build_pools(nc: NormalizedChain, batch_rows: list[Any],
                 has_any_plan = corr_sub is not None and any(
                     m["measurement_plan_id"] is not None
                     for m in measured.values())
-                # 实例内封闭环传播方差（分辨率独立 + ρ 相关的 rest）
+                lin_models_flat = [
+                    (plan_by.get(d) or {}).get("linear_bias_model")
+                    for d in dims]
+                # 实例内封闭环传播方差（分辨率独立 + ρ 相关的 rest
+                # + 线性偏倚模型按各实测值传播的系数/标准件不确定度）
                 var = float((signs * u_res) @ (signs * u_res))
                 if corr_sub is not None and u_rest.any():
                     wr = signs * u_rest
                     var += float((corr_sub * wr[:, None] * wr[None, :]).sum())
+                lin_var = 0.0
+                for j, d in enumerate(dims):
+                    lin_var += signs[j] ** 2 * measured[d][
+                        "linear_bias_std_uncertainty_mm"] ** 2
+                var += lin_var
                 instances.append({
                     "pool": spec.name,
                     "batch_id": brow.id,
@@ -215,6 +236,8 @@ def build_pools(nc: NormalizedChain, batch_rows: list[Any],
                     "signs": signs.tolist(),
                     "u_res_mm": u_res.tolist(),
                     "u_rest_mm": u_rest.tolist(),
+                    "linear_models": lin_models_flat,
+                    "linear_bias_variance_mm2": float(lin_var),
                     # 只要引用了测量方案（即使只有分辨率分量）就要传播误差
                     "has_plan": has_any_plan,
                     "corr": corr_sub.tolist() if corr_sub is not None else None,
@@ -628,6 +651,34 @@ def mc_assembly_gap(instances: list[dict[str, Any]], seed: int,
                 if float(u_res @ u_res) > 0.0:
                     eps = eps + rng.uniform(-half, half, size=(samples, d))
                 col = eps @ signs
+                # 线性偏倚模型：逐实例独立抽取回归系数误差（含标准件
+                # u(ref)），按各实测值逆回归梯度传播到组合间隙
+                lin_models = ins.get("linear_models") or []
+                for jj, model in enumerate(lin_models):
+                    if model is None:
+                        continue
+                    from .linearity import apply_linear_bias_model
+                    x_mm = float(ins["measured"][ins["dimensions"][jj]]["value_mm"])
+                    ev = apply_linear_bias_model(model, x_mm)
+                    if not (ev["in_applicable_range"]
+                            and ev["correction_applied"]):
+                        continue
+                    covm = np.asarray(
+                        model["coefficient_covariance_mm2"], dtype=float)
+                    covm = 0.5 * (covm + covm.T)
+                    try:
+                        chol = np.linalg.cholesky(covm + 1e-18 * np.eye(2))
+                    except np.linalg.LinAlgError:
+                        eigvals, eigvecs = np.linalg.eigh(covm)
+                        chol = eigvecs * np.sqrt(np.maximum(eigvals, 0.0))
+                    delta = rng.standard_normal((samples, 2)) @ chol.T
+                    a = float(model["intercept_mm"])
+                    bsl = float(model["slope"])
+                    denom = 1.0 + bsl
+                    grad_a = -1.0 / denom
+                    grad_b = -(x_mm - a) / denom ** 2
+                    col = col + signs[jj] * (
+                        grad_a * delta[:, 0] + grad_b * delta[:, 1])
             cache[key] = col
         col = cache[key]
         if col is not None:

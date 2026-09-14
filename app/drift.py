@@ -111,6 +111,8 @@ def _gage_block(nc, brow) -> tuple[dict[str, Any], dict[str, float]]:
     bias = {i: 0.0 for i in ids}
     u_rest = {i: 0.0 for i in ids}
     u_res = {i: 0.0 for i in ids}
+    u_bias_lin = {i: 0.0 for i in ids}
+    lin_models: dict[str, Any] = {}
     k_dim = {i: None for i in ids}
     plan_id = brow.measurement_plan_id
     combined = None
@@ -122,13 +124,26 @@ def _gage_block(nc, brow) -> tuple[dict[str, Any], dict[str, float]]:
             brow.measurement_json.get("policy", {})
             .get("output_coverage_factor", 2.0))
     if combined is not None:
+        from .linearity import apply_linear_bias_model
+
         by_id = {p["dimension_id"]: p for p in combined["dimensions"]}
         for i in ids:
             p = by_id.get(i)
             if p is None:
                 continue
-            bias[i] = float(p["bias_correction_mm"])
-            u_rest[i] = float(p["u_rest_mm"])
+            lin = p.get("linear_bias_model")
+            if lin is not None:
+                # 线性偏倚研究：u_bias 取适用量程中点的预测偏倚不确定度；
+                # 逐工件偏倚修正按实测值在 _extract_batches 中计算；
+                # 方案合成时已保证线性模型项不进入 u_rest
+                bias[i] = 0.0
+                u_rest[i] = float(p["u_rest_mm"])
+                u_bias_lin[i] = float(
+                    lin["representative_bias_std_uncertainty_mm"])
+                lin_models[i] = lin
+            else:
+                bias[i] = float(p["bias_correction_mm"])
+                u_rest[i] = float(p["u_rest_mm"])
             u_res[i] = float(p["components_mm"]["u_resolution"])
             k_i = p.get("coverage_factor")
             if k_i is None:
@@ -138,22 +153,29 @@ def _gage_block(nc, brow) -> tuple[dict[str, Any], dict[str, float]]:
     else:
         corr = np.eye(len(ids))
 
-    # 封闭环 GUM 传播（只含共用量具 rest 部分；与 measurement.evaluate_batch 同式）
+    # 封闭环 GUM 传播（常量共用量具 rest + 逐实测值线性偏倚模型项）
     wr = np.array([signs[j] * u_rest[ids[j]] for j in range(len(ids))])
     var_closure_rest = float((corr * wr[:, None] * wr[None, :]).sum())
-    u_g_closure = math.sqrt(max(var_closure_rest, 0.0))
+    # 线性项取中点代表性值（逐批真实值随组成样本变化，见批次结果）
+    wl = np.array([signs[j] * u_bias_lin[ids[j]] for j in range(len(ids))])
+    var_closure_lin = float((wl ** 2).sum())
+    u_g_closure = math.sqrt(max(var_closure_rest + var_closure_lin, 0.0))
     gage = {
         "has_plan": combined is not None,
         "measurement_plan_id": plan_id,
         "u_rest_mm": {i: float(u_rest[i]) for i in ids},
         "u_resolution_mm": {i: float(u_res[i]) for i in ids},
+        "u_linear_bias_mm": {i: float(u_bias_lin[i]) for i in ids},
+        "linear_bias_models": lin_models,
         "bias_correction_mm": {i: float(bias[i]) for i in ids},
         "coverage_factor_dimension": {
             i: (float(k_dim[i]) if k_dim[i] is not None else None)
             for i in ids},
         "closure": {
             "u_g_mm": u_g_closure,
-            "variance_mm2": var_closure_rest,
+            "variance_mm2": var_closure_rest + var_closure_lin,
+            "variance_from_correlated_rest_mm2": var_closure_rest,
+            "variance_from_linear_bias_mm2": var_closure_lin,
             "output_coverage_factor": k_out,
             "expanded_uncertainty_mm": k_out * u_g_closure,
         },
@@ -177,7 +199,14 @@ def _extract_batches(nc, batch_rows, sampled_at: dict[int, str]) -> list[_BatchD
                 m = by_dim.get(i)
                 if m is None or m["value"] is None:
                     continue
-                vals_mm[i] = to_mm(m["value"], m["unit"]) + bias[i]
+                x_mm = to_mm(m["value"], m["unit"])
+                lin = gage["linear_bias_models"].get(i)
+                if lin is not None:
+                    from .linearity import apply_linear_bias_model
+                    ev = apply_linear_bias_model(lin, x_mm)
+                    vals_mm[i] = float(ev["corrected_mm"])
+                else:
+                    vals_mm[i] = x_mm + bias[i]
                 samples[i].append(vals_mm[i])
             if len(vals_mm) == len(ids):
                 complete.append(
@@ -436,13 +465,18 @@ def _evaluate_target(spec: _TargetSpec, batches: list[_BatchData],
             sample_std = (float(np.std(vals, ddof=1))
                           if n >= 2 else None)
             u_g = b.gage["u_rest_mm"][spec.dimension_id]
+            u_lin = b.gage.get(
+                "u_linear_bias_mm", {}).get(spec.dimension_id, 0.0)
+            u_g_total = math.sqrt(u_g ** 2 + u_lin ** 2)
             k_i = b.gage["coverage_factor_dimension"][spec.dimension_id]
             gage_block = {
                 "measurement_plan_id": b.measurement_plan_id,
-                "u_g_mm": float(u_g),
+                "u_g_mm": float(u_g_total),
+                "u_rest_mm": float(u_g),
+                "u_linear_bias_mm": float(u_lin),
                 "coverage_factor": k_i,
                 "expanded_uncertainty_mm": (
-                    float(k_i * u_g) if k_i is not None else None),
+                    float(k_i * u_g_total) if k_i is not None else None),
             }
         else:
             vals = b.closure_complete

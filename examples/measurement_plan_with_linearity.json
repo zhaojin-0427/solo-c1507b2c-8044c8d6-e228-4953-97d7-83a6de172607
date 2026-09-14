@@ -1,0 +1,36 @@
+{
+  "name": "caliper-lin-L1-set-v1",
+  "note": "L1 引用已采用线性与偏倚研究 1（逆回归修正，量程内生效）；L2/L3 手填常量偏倚",
+  "gauges": [
+    {
+      "dimension_id": "L1",
+      "unit": "mm",
+      "resolution": 0.01,
+      "calibration_expanded_uncertainty": 0.004,
+      "coverage_factor": 2.0,
+      "repeatability_std": 0.003
+    },
+    {
+      "dimension_id": "L2",
+      "unit": "mm",
+      "resolution": 0.005,
+      "calibration_expanded_uncertainty": 0.003,
+      "coverage_factor": 2.0,
+      "bias_correction": 0.0,
+      "bias_std_uncertainty": 0.0005,
+      "repeatability_std": 0.002
+    },
+    {
+      "dimension_id": "L3",
+      "unit": "mm",
+      "resolution": 0.01,
+      "calibration_expanded_uncertainty": 0.006,
+      "coverage_factor": 2.0,
+      "bias_correction": -0.001,
+      "bias_std_uncertainty": 0.0015,
+      "repeatability_std": 0.004
+    }
+  ],
+  "correlations": [],
+  "linearity_studies": {"L1": 1}
+}

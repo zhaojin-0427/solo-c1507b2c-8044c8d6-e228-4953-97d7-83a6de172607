@@ -71,6 +71,15 @@ from .drift_schemas import (
     DriftStudyCreate,
     DriftStudyFinalizeRequest,
 )
+from .linearity import LinearityError, apply_linear_bias_model, bias_model_snapshot
+from .linearity import compare_results as compare_linearity_results
+from .linearity import run_study as run_linearity_study
+from .linearity_schemas import (
+    LinearityStudyAdoptRequest,
+    LinearityStudyCopyRequest,
+    LinearityStudyCreate,
+    LinearityStudyFinalizeRequest,
+)
 from .measurement import evaluate_batch, normalize_plan
 from .optimizer import search_cost_targets
 from .scenarios import (
@@ -526,8 +535,38 @@ def create_measurement_plan(chain_id: int, payload: MeasurementPlanCreate) -> di
             "name": srow.name,
             "total_gage_std_mm": srow.result_json["total_gage_std_mm"],
         }
+    linearity_refs: dict[str, dict] = {}
+    for dim_id, study_id in payload.linearity_studies.items():
+        lrow = db.get_linearity_study(study_id)
+        if lrow is None or lrow.chain_id != chain_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"链 {chain_id} 下量具线性与偏倚研究 {study_id} 不存在",
+            )
+        if lrow.dimension_id != dim_id:
+            raise HTTPException(
+                status_code=422,
+                detail=f"线性与偏倚研究 {study_id} 针对尺寸 "
+                       f"{lrow.dimension_id!r}，不能用于尺寸 {dim_id!r}",
+            )
+        if lrow.status != "adopted":
+            raise HTTPException(
+                status_code=422,
+                detail=f"线性与偏倚研究 {study_id} 状态为 {lrow.status}："
+                       "只有已采用(adopted)的研究才能接入测量方案"
+                       "（草案请先定稿再采用）",
+            )
+        if not lrow.result_json.get("adoptable"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"线性与偏倚研究 {study_id} 不具备采用条件: "
+                       + "；".join(lrow.result_json.get("adoption_blockers") or
+                                   ["拟合不可用或量程覆盖不足"]),
+            )
+        linearity_refs[dim_id] = bias_model_snapshot(lrow)
     try:
-        combined = normalize_plan(nc, payload, gage_rr=gage_rr_refs)
+        combined = normalize_plan(nc, payload, gage_rr=gage_rr_refs,
+                                  linearity=linearity_refs)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     plan_id = db.save_measurement_plan(
@@ -2528,4 +2567,233 @@ def finalize_drift_study(study_id: int,
     answer["freeze_note"] = (
         "已冻结来源批次、算法参数与计算结果；后续检验数据不得改写本研究，"
         "定稿研究也不能再派生排除版本（如需排除异常批次请在定稿前复制）")
+    return answer
+
+
+# -------------------------------------------------------- 量具线性与偏倚研究
+
+def _linearity_study_payload(row, *, comparison: dict | None = None) -> dict:
+    return {
+        "study_id": row.id,
+        "chain_id": row.chain_id,
+        "dimension_id": row.dimension_id,
+        "name": row.name,
+        "note": row.note,
+        "status": row.status,
+        "version_no": row.version_no,
+        "parent_study_id": row.parent_study_id,
+        "finalized_note": row.finalized_note or None,
+        "adopted_note": row.adopted_note or None,
+        "finalized_at": (row.finalized_at.isoformat()
+                         if row.finalized_at else None),
+        "adopted_at": (row.adopted_at.isoformat()
+                       if row.adopted_at else None),
+        "exclusions": row.exclusions_json or [],
+        "created_at": row.created_at.isoformat(),
+        "submitted_input": row.request_json,
+        "result": row.result_json,
+        **({"comparison_with_parent": comparison} if comparison else {}),
+    }
+
+
+def _load_linearity_study(study_id: int):
+    row = db.get_linearity_study(study_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"量具线性与偏倚研究 {study_id} 不存在")
+    return row
+
+
+@app.post("/chains/{chain_id}/linearity-studies", status_code=201,
+          tags=["linearity"])
+def create_linearity_study(chain_id: int,
+                           payload: LinearityStudyCreate) -> dict:
+    """建立量具线性与偏倚研究（草案 draft）：一件量具在工作量程内多点核查。
+
+    研究引用基线链中的一个尺寸；逐核查点记录有证标准件编号、证书参考值
+    及其标准不确定度（可逐点混用单位）、操作者、测量次序与重复读数。
+    未知尺寸、标准件编号重复、参考值超出工作量程、(操作者, 重复) 组合或
+    测量次序重复、非有限值一律 422。
+    系统逐点给平均偏倚、标准不确定度（含 u(ref) 与读数重复性）、t/z
+    置信区间与显著性，以标准不确定度加权拟合偏倚–参考值直线，汇总截距、
+    斜率、残差、失配检验与回归系数协方差（GUM 含标准件不确定度 / 经典
+    残差两套），并声明适用量程。参考点不足、量程覆盖过窄或拟合失效时
+    regression_available/coverage_adequate 标记为 false 且不得外推。
+    草案可复制排除异常读数；定稿后冻结，采用后方可接入测量方案。
+    """
+    row = _load_chain(chain_id)
+    nc = rebuild_normalized(row.request_json)
+    chain_ids = [d.id for d in nc.dimensions]
+    if payload.dimension_id not in chain_ids:
+        raise HTTPException(
+            status_code=422,
+            detail=f"尺寸 {payload.dimension_id!r} 不在基线链 {chain_id} 上"
+                   f"（未知尺寸）；链上尺寸: {chain_ids}",
+        )
+    try:
+        result = run_linearity_study(payload)
+    except LinearityError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    study_id = db.save_linearity_study(
+        chain_id, payload.dimension_id, payload.name, payload.note,
+        payload.model_dump(mode="json"), result,
+        exclusions=[], parent_study_id=None, version_no=1)
+    saved = db.get_linearity_study(study_id)
+    return _linearity_study_payload(saved)
+
+
+@app.get("/chains/{chain_id}/linearity-studies", tags=["linearity"])
+def list_linearity_studies(chain_id: int) -> dict:
+    _load_chain(chain_id)
+    return {"chain_id": chain_id,
+            "studies": db.list_linearity_studies(chain_id)}
+
+
+@app.get("/linearity-studies/{study_id}", tags=["linearity"])
+def get_linearity_study(study_id: int) -> dict:
+    """读取研究快照：核查点、读数与拟合结果创建时固化，重复读取不变。"""
+    return _linearity_study_payload(_load_linearity_study(study_id))
+
+
+@app.post("/linearity-studies/{study_id}/copy", status_code=201, tags=["linearity"])
+def copy_linearity_study(study_id: int,
+                         payload: LinearityStudyCopyRequest) -> dict:
+    """复制研究：可逐读数注明原因排除异常读数，比较排除前后结论。
+
+    父研究必须为草案（已定稿 / 已采用 422）；排除对象必须是父研究中的
+    实际读数（核查点 / 操作者 / 重复序号）且原因非空，排除后每个保留
+    核查点至少一个读数、且至少保留 2 个核查点。父研究保持不变，副本
+    附 comparison_with_parent（逐点偏倚与显著性、截距 / 斜率与显著性、
+    适用量程与可采用性逐项对比）。副本仍为草案，可继续复制 / 定稿。
+    """
+    parent = _load_linearity_study(study_id)
+    if parent.status != "draft":
+        raise HTTPException(
+            status_code=422,
+            detail=f"线性与偏倚研究 {study_id} 状态为 {parent.status}："
+                   "已定稿 / 已采用的研究不能再复制排除版本"
+        )
+    req = parent.request_json
+    reading_index: dict[tuple[str, str, int], dict] = {}
+    for p in req["points"]:
+        for r in p["readings"]:
+            reading_index[(p["point_id"], r["operator"], r["replicate"])] = r
+    excluded_keys = {(e.point_id, e.operator, e.replicate)
+                     for e in payload.exclusions}
+    unknown = sorted(k for k in excluded_keys if k not in reading_index)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"排除读数 {unknown} 不在父研究 {study_id} 中"
+                   "（键为 核查点/操作者/重复序号）")
+
+    remaining_points = 0
+    empty_points = []
+    for p in req["points"]:
+        kept = [r for r in p["readings"]
+                if (p["point_id"], r["operator"], r["replicate"])
+                not in excluded_keys]
+        if kept:
+            remaining_points += 1
+        else:
+            empty_points.append(p["point_id"])
+    if remaining_points < 2:
+        raise HTTPException(
+            status_code=422,
+            detail=f"排除后仅剩 {remaining_points} 个有读数的核查点："
+                   "线性拟合至少需要 2 个参考值不同的核查点"
+                   + (f"；被清空的核查点: {empty_points}" if empty_points else ""))
+
+    new_payload = LinearityStudyCreate.model_validate(req)
+    exclusions_store = [
+        {"point_id": e.point_id, "operator": e.operator,
+         "replicate": e.replicate, "reason": e.reason,
+         "measurement_order": reading_index[
+             (e.point_id, e.operator, e.replicate)]["measurement_order"]}
+        for e in payload.exclusions
+    ]
+    try:
+        result = run_linearity_study(
+            new_payload, exclusions=exclusions_store,
+            copied_from={"parent_study_id": parent.id,
+                         "parent_name": parent.name,
+                         "excluded_readings": exclusions_store})
+    except LinearityError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    new_no = parent.version_no + 1
+    new_name = payload.name or f"{parent.name}-复制"
+    new_id = db.save_linearity_study(
+        parent.chain_id, parent.dimension_id, new_name, payload.note,
+        new_payload.model_dump(mode="json"), result,
+        exclusions=exclusions_store, parent_study_id=parent.id,
+        version_no=new_no)
+    comparison = compare_linearity_results(parent.result_json, result)
+    comparison["parent_study_id"] = parent.id
+    comparison["copied_study_id"] = new_id
+    saved = db.get_linearity_study(new_id)
+    return _linearity_study_payload(saved, comparison=comparison)
+
+
+@app.post("/linearity-studies/{study_id}/finalize", tags=["linearity"])
+def finalize_linearity_study(study_id: int,
+                             payload: LinearityStudyFinalizeRequest) -> dict:
+    """定稿研究：核查点、读数与拟合结果冻结，不可再复制或改写。
+
+    只有草案可定稿（重复定稿 / 已定稿后操作 422）。拟合失效或量程覆盖
+    过窄的研究仍可定稿留档，但不可采用。
+    """
+    row = _load_linearity_study(study_id)
+    if row.status != "draft":
+        raise HTTPException(
+            status_code=422,
+            detail=f"线性与偏倚研究 {study_id} 当前状态为 {row.status}："
+                   "只有草案可以定稿（不可重复定稿或改写）")
+    db.finalize_linearity_study(study_id, payload.note)
+    saved = db.get_linearity_study(study_id)
+    answer = _linearity_study_payload(saved)
+    answer["freeze_note"] = (
+        "已冻结核查点、标准件参考值与不确定度、读数与拟合结果；"
+        "定稿研究不能再派生排除版本或改写，采用后方可接入测量方案")
+    return answer
+
+
+@app.post("/linearity-studies/{study_id}/adopt", tags=["linearity"])
+def adopt_linearity_study(study_id: int,
+                          payload: LinearityStudyAdoptRequest) -> dict:
+    """采用研究：状态 finalized → adopted，可接入测量方案。
+
+    采用前置（任一不满足 422）：研究已定稿；线性拟合可用（参考点 ≥ 2、
+    参考值有变差、设计矩阵非奇异）；参考值对工作量程覆盖不低于声明的
+    min_span_coverage（不得外推）。已采用研究重复采用 422。采用不改写
+    任何快照；历史测量方案与检验批次保持原结果。
+    """
+    row = _load_linearity_study(study_id)
+    if row.status == "draft":
+        raise HTTPException(
+            status_code=422,
+            detail=f"线性与偏倚研究 {study_id} 尚为草案：请先定稿再采用")
+    if row.status == "adopted":
+        raise HTTPException(
+            status_code=422,
+            detail=f"线性与偏倚研究 {study_id} 已采用（采用时间 "
+                   f"{row.adopted_at.isoformat() if row.adopted_at else ''}），"
+                   "不能重复采用")
+    res = row.result_json
+    if not res["adoptable"]:
+        raise HTTPException(
+            status_code=422,
+            detail="研究不具备采用条件: "
+                   + "；".join(res.get("adoption_blockers") or
+                               ["拟合不可用或量程覆盖不足"]))
+    db.adopt_linearity_study(study_id, payload.note)
+    saved = db.get_linearity_study(study_id)
+    answer = _linearity_study_payload(saved)
+    model = bias_model_snapshot(saved)
+    answer["bias_model"] = model
+    answer["adopt_note"] = (
+        "已采用：测量方案可引用本研究，检验批次按实测值做逆回归线性偏倚"
+        "修正并传播回归系数与标准件参考值不确定度；修正仅在适用量程 "
+        f"{model['applicable_range_mm']} mm 内生效，量程外不外推；"
+        "历史测量方案与检验批次保持原结果")
     return answer

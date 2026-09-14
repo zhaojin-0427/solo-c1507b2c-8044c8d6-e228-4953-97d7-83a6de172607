@@ -1,0 +1,73 @@
+{
+  "name": "lin-L1-caliper-2026",
+  "note": "L1 数显卡尺工作量程 49~51 mm：5 件有证标准件（GB-S-*），每件 3 次重复，含操作者与测量次序",
+  "dimension_id": "L1",
+  "unit": "mm",
+  "working_range_lower": 49.0,
+  "working_range_upper": 51.0,
+  "process_tolerance": 0.08,
+  "min_span_coverage": 0.5,
+  "confidence_level": 0.95,
+  "points": [
+    {
+      "point_id": "P1",
+      "standard_serial": "GB-S-4910",
+      "reference_value": 49.1,
+      "reference_unit": "mm",
+      "reference_std_uncertainty": 0.001,
+      "readings": [
+        {"replicate": 1, "value": 49.1045, "operator": "A", "measurement_order": 1},
+        {"replicate": 2, "value": 49.1066, "operator": "B", "measurement_order": 2},
+        {"replicate": 3, "value": 49.1084, "operator": "A", "measurement_order": 3}
+      ]
+    },
+    {
+      "point_id": "P2",
+      "standard_serial": "GB-S-4955",
+      "reference_value": 49.55,
+      "reference_unit": "mm",
+      "reference_std_uncertainty": 0.001,
+      "readings": [
+        {"replicate": 1, "value": 49.5547, "operator": "B", "measurement_order": 4},
+        {"replicate": 2, "value": 49.5568, "operator": "A", "measurement_order": 5},
+        {"replicate": 3, "value": 49.5586, "operator": "B", "measurement_order": 6}
+      ]
+    },
+    {
+      "point_id": "P3",
+      "standard_serial": "GB-S-5000",
+      "reference_value": 50.0,
+      "reference_unit": "mm",
+      "reference_std_uncertainty": 0.001,
+      "readings": [
+        {"replicate": 1, "value": 49.9990, "operator": "A", "measurement_order": 7},
+        {"replicate": 2, "value": 50.0010, "operator": "B", "measurement_order": 8},
+        {"replicate": 3, "value": 50.0031, "operator": "A", "measurement_order": 9}
+      ]
+    },
+    {
+      "point_id": "P4",
+      "standard_serial": "GB-S-5045",
+      "reference_value": 50.45,
+      "reference_unit": "mm",
+      "reference_std_uncertainty": 0.001,
+      "readings": [
+        {"replicate": 1, "value": 50.4493, "operator": "B", "measurement_order": 10},
+        {"replicate": 2, "value": 50.4512, "operator": "A", "measurement_order": 11},
+        {"replicate": 3, "value": 50.4533, "operator": "B", "measurement_order": 12}
+      ]
+    },
+    {
+      "point_id": "P5",
+      "standard_serial": "GB-S-5090",
+      "reference_value": 50.9,
+      "reference_unit": "mm",
+      "reference_std_uncertainty": 0.001,
+      "readings": [
+        {"replicate": 1, "value": 50.8995, "operator": "A", "measurement_order": 13},
+        {"replicate": 2, "value": 50.9016, "operator": "B", "measurement_order": 14},
+        {"replicate": 3, "value": 50.9034, "operator": "A", "measurement_order": 15}
+      ]
+    }
+  ]
+}

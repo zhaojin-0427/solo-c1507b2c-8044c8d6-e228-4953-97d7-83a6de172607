@@ -163,6 +163,133 @@ def test_one_sided_chart_and_param_overrides(client):
     assert t1["params"]["min_sample_size"] == 10
 
 
+def test_closure_contribution_share_normalized_by_absolute_sum(client):
+    """带符号贡献互相抵消时，占比分母必须是各贡献绝对值之和。
+
+    构造批内同值序列：L1 首末批均值差 +0.010（s=+1 → 贡献 +0.010），
+    L3 差 −0.009（s=−1 → 贡献 +0.009…）改用 L1/L2 同向放大、L3 反向
+    抵消，使带符号合计 ≠ 绝对值之和。
+    """
+    cid = _make_chain(client)
+
+    def flat(name, v1, v2, v3):
+        rows = [{"serial": f"{name}-{i}", "measurements": [
+            {"dimension_id": "L1", "value": v1, "unit": "mm"},
+            {"dimension_id": "L2", "value": v2, "unit": "mm"},
+            {"dimension_id": "L3", "value": v3, "unit": "mm"}]}
+            for i in range(10)]
+        r = client.post(f"/chains/{cid}/inspection-batches",
+                        json={"name": name, "rows": rows,
+                              "bootstrap_samples": 1000})
+        assert r.status_code == 201, r.text
+        return r.json()["batch_id"]
+
+    # 封闭环 C = L1 + L2 − L3；L1 上漂 0.010，L3 也上漂 0.009
+    # => L1 贡献 +0.010，L3 贡献 −0.009；L2 不动贡献 0
+    bids = [flat("early", 50.04, 30.30, 80.00),
+            flat("late", 50.05, 30.30, 80.009)]
+    specs = [{"batch_id": bids[0], "sampled_at": "2026-01-01T08:00:00+00:00"},
+             {"batch_id": bids[1], "sampled_at": "2026-02-01T08:00:00+00:00"}]
+    r = client.post(f"/chains/{cid}/drift-studies", json={
+        "name": "share", "batches": specs, "monitor_closure": True,
+        "defaults": {"min_sample_size": 5}})
+    assert r.status_code == 201, r.text
+    cc = r.json()["result"]["closure_drift_contributions"]
+    by = {d["dimension_id"]: d for d in cc["dimensions"]}
+    assert by["L1"]["closure_drift_contribution_mm"] == pytest.approx(0.010)
+    assert by["L2"]["closure_drift_contribution_mm"] == pytest.approx(0.0)
+    assert by["L3"]["closure_drift_contribution_mm"] == pytest.approx(-0.009)
+    # 带符号合计 0.001 ≠ 绝对值之和 0.019
+    assert cc["signed_contributions_total_mm"] == pytest.approx(0.001)
+    assert cc["observed_closure_drift_mm"] == pytest.approx(0.001)
+    # 占比按绝对值之和 0.019 归一（不是 ±10 倍放大）
+    assert by["L1"]["share_of_observed_closure_drift"] == pytest.approx(
+        0.010 / 0.019)
+    assert by["L3"]["share_of_observed_closure_drift"] == pytest.approx(
+        -0.009 / 0.019)
+    assert by["L2"]["share_of_observed_closure_drift"] == pytest.approx(0.0)
+    shares = [d["share_of_observed_closure_drift"]
+              for d in cc["dimensions"]]
+    assert sum(abs(x) for x in shares) == pytest.approx(1.0)
+
+
+def test_ewma_change_point_at_step_start_one_sided(client):
+    """单侧 EWMA 面对第 3 批开始的确定性阶跃：上下两个方向都应定位到第 3 批。"""
+    cid = _make_chain(client)
+
+    def flat(name, v1):
+        rows = [{"serial": f"{name}-{i}", "measurements": [
+            {"dimension_id": "L1", "value": v1, "unit": "mm"},
+            {"dimension_id": "L2", "value": 30.30, "unit": "mm"},
+            {"dimension_id": "L3", "value": 80.00, "unit": "mm"}]}
+            for i in range(30)]
+        r = client.post(f"/chains/{cid}/inspection-batches",
+                        json={"name": name, "rows": rows,
+                              "bootstrap_samples": 1000})
+        assert r.status_code == 201, r.text
+        return r.json()["batch_id"]
+
+    se = 0.02 / math.sqrt(30)
+    step = 0.012 / se                      # 阶跃大小（σ0 单位，约 3.29）
+    for sided, sign in (("one_sided_up", 1), ("one_sided_down", -1)):
+        shifts = (0.0, 0.0) + (0.012, 0.012, 0.012, 0.012)
+        bids = [flat(f"{sided}-{t}", 50.04 + sign * d)
+                for t, d in enumerate(shifts)]
+        r = client.post(f"/chains/{cid}/drift-studies", json={
+            "name": f"step-{sided}", "batches": _specs(bids),
+            "dimensions": [{"dimension_id": "L1", "overrides": {
+                "sidedness": sided, "ewma_lambda": 0.4, "ewma_L": 2.0,
+                "cusum_k": 0.5, "cusum_h": 8.0}}],   # CUSUM 放松，只看 EWMA
+            "defaults": {"min_sample_size": 10}})
+        assert r.status_code == 201, r.text
+        ew = _target(r.json()["result"], "dim:L1")["ewma"]
+        assert ew["alarmed"] is True, sided
+        cp = ew["change_point"]
+        assert cp["batch_index"] == 3, (sided, cp)
+        assert cp["between_batch_index"] == 2
+        assert cp["estimated_shift_sigma"] == pytest.approx(sign * step,
+                                                            rel=1e-6)
+
+
+def test_cusum_change_point_uses_latest_alarm_run(client):
+    """短暂累计归零后重新累计报警：变点必须落在本轮起点而非第一批。"""
+    cid = _make_chain(client)
+
+    def flat(name, v1):
+        rows = [{"serial": f"{name}-{i}", "measurements": [
+            {"dimension_id": "L1", "value": v1, "unit": "mm"},
+            {"dimension_id": "L2", "value": 30.30, "unit": "mm"},
+            {"dimension_id": "L3", "value": 80.00, "unit": "mm"}]}
+            for i in range(40)]
+        r = client.post(f"/chains/{cid}/inspection-batches",
+                        json={"name": name, "rows": rows,
+                              "bootstrap_samples": 1000})
+        assert r.status_code == 201, r.text
+        return r.json()["batch_id"]
+
+    # σ0/√n = 0.02/√40；批次偏移 0.004/0/0/0.013/0.032（mm）对应
+    # z ≈ 1.26, 0, 0, 4.11, 10.12；k=0.5、h=4.5 时首批短暂累计后归零，
+    # 第 4 批重新累计（C+=3.61 未越限）、第 5 批报警。
+    se = 0.02 / math.sqrt(40)
+    bids = [flat(f"b{t}", 50.04 + d)
+            for t, d in enumerate((0.004, 0.0, 0.0, 0.013, 0.032))]
+    r = client.post(f"/chains/{cid}/drift-studies", json={
+        "name": "rerun", "batches": _specs(bids),
+        "dimensions": [{"dimension_id": "L1", "overrides": {
+            "cusum_k": 0.5, "cusum_h": 4.5}}],
+        "defaults": {"min_sample_size": 10}})
+    assert r.status_code == 201, r.text
+    t1 = _target(r.json()["result"], "dim:L1")
+    cu = t1["cusum"]
+    assert cu["alarmed"] is True
+    assert cu["first_alarm_batch_index"] == 5
+    cp = cu["change_point"]
+    assert cp["batch_index"] == 4
+    assert cp["between_batch_index"] == 3
+    assert cp["estimated_shift_sigma"] == pytest.approx(
+        np.mean([0.013 / se, 0.032 / se]), rel=1e-6)
+
+
 def test_one_sided_down_drift_detected_deterministic(client):
     """批内同值的确定性下漂序列：z=0,-2.68,-5.37,...；单侧下向图必报 down。"""
     cid = _make_chain(client)

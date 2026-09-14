@@ -213,59 +213,38 @@ def _cusum(z: np.ndarray, sidedness: str, k: float, h: float) -> dict[str, Any]:
             cn = max(0.0, cn - float(zv) - k)
         plus.append(cp if use_up else None)
         minus.append(cn if use_down else None)
-        if first_alarm_idx is None and (
-                (use_up and cp > h) or (use_down and cn > h)):
+        up_now = use_up and cp > h
+        down_now = use_down and cn > h
+        if first_alarm_idx is None and (up_now or down_now):
             first_alarm_idx = t
-            if use_up and cp > h and (not use_down or cp >= cn):
-                alarm_direction = "up"
+            if up_now and down_now:
+                # 同批双侧越限：以累计更强一侧定方向
+                alarm_direction = "up" if cp >= cn else "down"
             else:
-                alarm_direction = "down"
+                alarm_direction = "up" if up_now else "down"
 
     def margin(stat) -> float | None:
         return None if stat is None else float(h - stat)
 
-    # 变点：报警轮内累计首次归零后的第一批；未报警取累计分数最后谷底
-    run_plus = np.array([0.0] + [v if v is not None else 0.0 for v in plus])
-    run_minus = np.array([0.0] + [v if v is not None else 0.0 for v in minus])
-
-    def _cp_for(seq: np.ndarray) -> tuple[int, float] | None:
-        """seq 长度 T+1（seq[0]=0）。返回 (变点在 z 中的下标, 变点后标准化均值)。"""
-        nz = np.nonzero(seq[1:] > 0.0)[0]
-        if nz.size == 0:
-            return None
-        start = int(nz[0])              # 该段累计从 z[start] 起非零
-        idx_after = np.arange(start, len(z))
-        if idx_after.size == 0:
-            return None
-        return start, float(np.mean(z[idx_after]))
-
-    cp_plus = _cp_for(run_plus) if use_up else None
-    cp_minus = _cp_for(run_minus) if use_down else None
-
-    def _peak(seq: np.ndarray) -> float:
-        return float(np.max(seq))
-
     if first_alarm_idx is not None:
-        # 以报警方向的累计段定位变点
-        chosen = None
-        if alarm_direction == "up" and cp_plus is not None:
-            chosen = cp_plus
-        elif alarm_direction == "down" and cp_minus is not None:
-            chosen = cp_minus
-        if chosen is None:
-            chosen = (cp_plus if cp_plus is not None
-                      else cp_minus if cp_minus is not None else None)
-        cp_idx, cp_shift = chosen if chosen is not None else (None, None)
-    elif cp_plus is not None or cp_minus is not None:
-        # 未报警：探索性变点 = 两侧累计峰值更大一侧的段起点
-        options = []
-        if cp_plus is not None:
-            options.append((_peak(run_plus), cp_plus))
-        if cp_minus is not None:
-            options.append((_peak(run_minus), cp_minus))
-        cp_idx, cp_shift = max(options, key=lambda o: o[0])[1]
+        # 变点 = 本次报警所在连续累计轮的起点：从报警批回溯到统计量
+        # 最后一次归零（短暂累计并归零的早期轮次不计入）。
+        stat = plus if alarm_direction == "up" else minus
+        start = _alarm_run_start(stat, first_alarm_idx)
+        cp_idx: int | None = start
     else:
-        cp_idx, cp_shift = None, None
+        # 未报警：探索性变点取各非零累计轮中峰值最高一轮的起点
+        options: list[tuple[float, int]] = []
+        if use_up:
+            s0, peak = _strongest_run(plus)
+            if s0 is not None:
+                options.append((peak, s0))
+        if use_down:
+            s0, peak = _strongest_run(minus)
+            if s0 is not None:
+                options.append((peak, s0))
+        cp_idx = max(options)[1] if options else None
+    cp_shift = (float(np.mean(z[cp_idx:])) if cp_idx is not None else None)
 
     return {
         "chart": "tabular_cusum",
@@ -280,6 +259,64 @@ def _cusum(z: np.ndarray, sidedness: str, k: float, h: float) -> dict[str, Any]:
         "first_alarm_direction": alarm_direction,
         "change_point": _change_point(z, cp_idx, cp_shift),
     }
+
+
+def _alarm_run_start(stat: list[float | None], alarm_idx: int) -> int:
+    """报警批 alarm_idx（z 的 0 基下标）所在连续累计轮的起点。
+
+    从报警批逐批回溯，直到上一批统计量归零（或不存在），返回归零后
+    第一批的 0 基下标——即本轮累计真正开始、漂移出现的批次。
+    """
+    t = alarm_idx
+    while t > 0:
+        prev = stat[t - 1]
+        if prev is None or prev <= 0.0:
+            break
+        t -= 1
+    return t
+
+
+def _strongest_run(stat: list[float | None]) -> tuple[int | None, float]:
+    """把统计量序列拆成若干连续非零轮，返回峰值最高一轮的 (起点, 峰值)。"""
+    best: tuple[float, int] | None = None
+    i, t_end = 0, len(stat)
+    while i < t_end:
+        v = stat[i]
+        if v is None or v <= 0.0:
+            i += 1
+            continue
+        start = i
+        peak = v
+        while i < t_end and stat[i] is not None and stat[i] > 0.0:
+            peak = max(peak, stat[i])
+            i += 1
+        if best is None or peak > best[0]:
+            best = (peak, start)
+    return (best[1], best[0]) if best is not None else (None, None)
+
+
+# EWMA 回溯变点时判定「实际过零」的零带（相对稳态标准差 sqrt(λ/(2−λ))）。
+# q 的微小同号残留是前序噪声经 (1−λ) 衰减后的尾巴，不算同号漂移段。
+_EWMA_ZERO_BAND = 0.1
+
+
+def _ewma_run_start(qs: list[float], alarm_idx: int, going_up: bool,
+                    band: float = _EWMA_ZERO_BAND) -> int:
+    """EWMA 报警批所在同向运行段的起点（z 的 0 基下标）。
+
+    从报警批逐批回溯，直到前一批 q 进入零带（|q| ≤ band）或与报警
+    方向异号，返回其后第一批——即 q 离开零带转向新水平、阶跃开始的
+    批次。band 为稳态标准差的比例（在调用处乘 sqrt(λ/(2−λ))）。
+    """
+    t = alarm_idx
+    while t > 0:
+        prev = qs[t - 1]
+        settled = abs(prev) <= band
+        opposite = prev <= 0.0 if going_up else prev >= 0.0
+        if settled or opposite:
+            break
+        t -= 1
+    return t
 
 
 def _ewma(z: np.ndarray, sidedness: str, lam: float,
@@ -297,28 +334,33 @@ def _ewma(z: np.ndarray, sidedness: str, lam: float,
         limit = L * math.sqrt(factor * (1.0 - (1.0 - lam) ** (2 * t)))
         qs.append(q)
         limits.append(limit)
-        if first_alarm_idx is None and (
-                (use_up and q > limit) or (use_down and q < -limit)):
+        up_now = use_up and q > limit
+        down_now = use_down and q < -limit
+        if first_alarm_idx is None and (up_now or down_now):
             first_alarm_idx = t - 1
-            if use_up and q > limit and (not use_down or q >= -q):
-                alarm_direction = "up"
-            else:
-                alarm_direction = "down"
+            alarm_direction = "up" if up_now else "down"
 
-    # 离线变点：稳态均值取全序列均值，S_t=Σ(z−z̄)；
-    # 向下变点取谷底，向上变点取峰前，双侧取更显著的一侧。
-    zmean = float(np.mean(z)) if len(z) else 0.0
-    s = np.cumsum(z - zmean)
-    if use_up and use_down:
-        trough_idx = int(np.argmin(s))
-        peak_idx = int(np.argmax(s))
-        cp_idx = peak_idx if abs(s[peak_idx]) > abs(s[trough_idx]) else trough_idx
-    elif use_up:
-        cp_idx = int(np.argmax(s))
+    if first_alarm_idx is not None:
+        # 变点 = 本次报警段的起点：从报警批回溯 q 最后一次为 0 /
+        # 与报警方向异号的位置，漂移自其后第一批开始。
+        cp_idx = _ewma_run_start(
+            qs, first_alarm_idx, alarm_direction == "up",
+            band=_EWMA_ZERO_BAND * math.sqrt(factor))
     else:
-        cp_idx = int(np.argmin(s))
-    idx_after = np.arange(cp_idx, len(z))
-    cp_shift = (float(np.mean(z[idx_after])) if len(idx_after) else None)
+        # 未报警：累积标准化残差 S_t=Σ(z−z̄) 的谷底（向下）或峰前
+        # （向上），双侧取更显著一侧；变点在极值点之后第一批
+        # （极值已在末批时取末批）。
+        zmean = float(np.mean(z)) if len(z) else 0.0
+        s = np.cumsum(z - zmean)
+        if use_up and use_down:
+            trough, peak = int(np.argmin(s)), int(np.argmax(s))
+            tau = peak if abs(s[peak]) > abs(s[trough]) else trough
+        elif use_up:
+            tau = int(np.argmax(s))
+        else:
+            tau = int(np.argmin(s))
+        cp_idx = min(tau + 1, len(z) - 1)
+    cp_shift = (float(np.mean(z[cp_idx:])) if cp_idx is not None else None)
 
     def margin_up(qq, ll):
         return float(ll - qq) if use_up else None
@@ -354,8 +396,11 @@ def _change_point(z: np.ndarray, cp_idx: int | None,
         "between_batch_index": cp_idx,               # 变点位于第 cp_idx 与 cp_idx+1 批之间
         "estimated_shift_sigma": (
             float(cp_shift) if cp_shift is not None else None),
-        "note": "CUSUM：本轮连续累计起点；EWMA：累积标准化残差谷底。"
-                "偏移量为变点之后批次 z 值的平均（σ0 单位），探索性估计",
+        "note": (
+            "报警时：CUSUM 取统计量最后归零后的本轮连续累计起点，"
+            "EWMA 取 q 最后过零后的同号段起点；未报警时为探索性候选"
+            "（CUSUM 最强非零累计轮起点；EWMA 累积标准化残差极值之后"
+            "第一批）。偏移量为变点之后批次 z 值的平均（σ0 单位）"),
         "after_batch_count": int(len(after)),
     }
 
@@ -634,11 +679,13 @@ def run_study(nc, baseline_result: dict[str, Any], batch_rows, payload,
                 last_means[d.id] = seq[-1]
         contribs = []
         total_signed = 0.0
+        total_abs = 0.0
         for d in nc.dimensions:
             if d.id in first_means:
                 delta = last_means[d.id] - first_means[d.id]
                 signed = signs[d.id] * delta
                 total_signed += signed
+                total_abs += abs(signed)
             else:
                 delta = signed = 0.0
             contribs.append({
@@ -650,10 +697,11 @@ def run_study(nc, baseline_result: dict[str, Any], batch_rows, payload,
                 "closure_drift_contribution_mm": float(signed),
             })
         for c in contribs:
-            denom = abs(total_signed)
+            # 占比按各尺寸带符号贡献的**绝对值之和**归一（可正可负、
+            # 可互相抵消；不能用带符号合计，否则 10 与 -9 会放大成 ±10）
             c["share_of_observed_closure_drift"] = (
-                c["closure_drift_contribution_mm"] / denom
-                if denom > 0 else None)
+                c["closure_drift_contribution_mm"] / total_abs
+                if total_abs > 0 else None)
         closure_first = [float(np.mean(b.closure_complete))
                          for b in batches if b.closure_complete]
         closure_contributions = {
@@ -778,8 +826,9 @@ FORMULAS = [
     "EWMA：q_t=λ·z_t+(1−λ)·q_{t-1}，q_0=0；时变限 "
     "±L·sqrt(λ/(2−λ)·(1−(1−λ)^{2t}))",
     "阈值余量：CUSUM 为 h−C±；EWMA 为 限−|q|（≤0 即已报警）",
-    "变点：CUSUM 取报警轮连续累计起点；EWMA 取累积标准化残差谷底；"
-    "偏移量为变点后批次 z 值平均（σ0 单位）",
+    "变点：报警时 CUSUM 取统计量最后归零后的本轮连续累计起点，"
+    "EWMA 取 q 最后过零后的同号段起点；未报警时为探索性候选"
+    "（CUSUM 最强非零累计轮起点；EWMA 累积标准化残差极值之后第一批）",
     "封闭环量具传播：u_g,C²=Σ_iΣ_j s_i s_j ρ_ij u_rest,i u_rest,j；"
     "扩展不确定度尺寸用 k_i、封闭环用 k_out",
     "各尺寸封闭环漂移贡献：s_i·(x̄_i,末批 − x̄_i,首批)（偏倚修正后均值）",

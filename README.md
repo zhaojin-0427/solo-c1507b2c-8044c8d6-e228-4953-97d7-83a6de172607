@@ -124,6 +124,11 @@ python3 -m venv --without-pip .venv        # 若 venv 自带 pip 可省略 get-p
 | GET | `/chains/{id}/drift-studies` / `/drift-studies/{sid}` | 漂移研究列表 / 读取冻结研究（来源批次、参数、结果创建时固化） |
 | POST | `/drift-studies/{sid}/copy` | 复制研究，逐批注明原因排除异常批次，比较排除前后报警/变点结论（父研究不变） |
 | POST | `/drift-studies/{sid}/finalize` | 定稿冻结来源批次、算法参数与计算结果（定稿后不得复制/改写，后续检验数据不影响） |
+| POST | `/chains/{id}/linearity-studies` | 建立**量具线性与偏倚研究**（一件量具在工作量程内对有证标准件多点核查；以标准不确定度加权拟合偏倚–参考值，创建为草案） |
+| GET | `/chains/{id}/linearity-studies` / `/linearity-studies/{sid}` | 研究列表 / 读取快照（核查点、读数与拟合结果创建时固化） |
+| POST | `/linearity-studies/{sid}/copy` | 复制研究，逐读数注明原因排除异常读数（可清空整个标准点），比较排除前后结论 |
+| POST | `/linearity-studies/{sid}/finalize` | 定稿（draft → finalized；定稿后不可复制/改写） |
+| POST | `/linearity-studies/{sid}/adopt` | 采用（finalized → adopted；拟合可用且量程覆盖达标方可采用，之后可接入测量方案） |
 
 ## 典型流程
 
@@ -183,6 +188,18 @@ curl -s -X POST localhost:8000/drift-studies/1/copy \
   -d '{"name":"排除异常批后","exclusions":[{"batch_id":4,"reason":"换模首批，工艺未稳定"}]}'
 curl -s -X POST localhost:8000/drift-studies/1/finalize \
   -H 'Content-Type: application/json' -d '{"note":"季度来料评审定稿"}'
+
+# 11) 量具线性与偏倚研究（有证标准件多点核查）：复制排除异常读数 →
+#     定稿 → 采用 → 被测量方案引用，检验批次按实测值逆回归修正偏倚
+curl -s -X POST localhost:8000/chains/1/linearity-studies \
+  -H 'Content-Type: application/json' -d @examples/linearity_study.json
+curl -s -X POST localhost:8000/linearity-studies/1/finalize \
+  -H 'Content-Type: application/json' -d '{"note":"量具评审定稿"}'
+curl -s -X POST localhost:8000/linearity-studies/1/adopt \
+  -H 'Content-Type: application/json' -d '{"note":"接入 L1 测量方案"}'
+curl -s -X POST localhost:8000/chains/1/measurement-plans \
+  -H 'Content-Type: application/json' \
+  -d @examples/measurement_plan_with_linearity.json
 ```
 
 ### 成本模型
@@ -814,6 +831,98 @@ s_i·(x̄_i,末批 − x̄_i,首批)，占比按各贡献**绝对值之和**归�
   与计算结果（重复定稿 422），不得再复制排除；后续检验数据（新批次、
   测量方案新版本）不改写已定稿研究。
 
+## 量具线性与偏倚研究（有证标准件多点核查）
+
+以**一件量具在工作量程内对有证标准件的多点核查**为一个独立版本对象
+（示例 `examples/linearity_study.json`），按 **草稿 draft → 已定稿
+finalized → 已采用 adopted** 流转，研究引用基线链中的一个尺寸：
+
+```bash
+curl -s -X POST localhost:8000/chains/1/linearity-studies \
+  -H 'Content-Type: application/json' -d @examples/linearity_study.json
+# 复制研究并把 P3 标准件的三次读数全部标为异常（其余 4 点仍可拟合）
+curl -s -X POST localhost:8000/linearity-studies/1/copy \
+  -H 'Content-Type: application/json' -d '{
+    "name":"排除P3后","exclusions":[
+      {"point_id":"P3","operator":"A","replicate":1,"reason":"碰动标准件"},
+      {"point_id":"P3","operator":"B","replicate":2,"reason":"碰动标准件"},
+      {"point_id":"P3","operator":"A","replicate":3,"reason":"碰动标准件"}]}'
+curl -s -X POST localhost:8000/linearity-studies/1/finalize \
+  -H 'Content-Type: application/json' -d '{"note":"季度量具评审定稿"}'
+curl -s -X POST localhost:8000/linearity-studies/1/adopt \
+  -H 'Content-Type: application/json' -d '{"note":"接入 L1 测量方案"}'
+```
+
+### 核查设计与校验
+
+每个核查点（`points[]`）记录有证标准件编号（全研究唯一）、证书**参考值**
+与其**标准不确定度 u(ref)**（可逐点混用长度单位，内部换算 mm）、
+若干重复读数；每条读数给操作者与全研究唯一的**测量次序**。
+Pydantic 与引擎联合校验：单位合法、参考值与读数有限、标准件编号 /
+核查点 id 不重复、同一核查点内 (操作者, 重复序号) 组合不重复、测量次序
+不重复、参考值落在声明工作量程内（跨单位越界在换算后 422）、
+工作量程下限严格小于上限。
+
+### 逐标准点结果
+
+平均偏倚 b̄_g = 均值(读数) − 参考值；重复性 s_g 取该点样本标准差，
+单点测量借用全研究合并（pooled-within）重复性，全研究无重复时重复性
+不可估计（只按 u(ref) 计权并告警）。合成点标准不确定度
+u_g = √(u_ref,g² + (s_g/√n_g)²)，平均偏倚置信区间
+b̄_g ± t_{p,ν}·u_g，有效自由度按 Welch–Satterthwaite
+（u(ref) 为 Type B，自由度 ∞）；区间不含 0 即该点偏倚显著。
+
+### 以标准不确定度加权的线性回归
+
+对偏倚–参考值做加权最小二乘 b_g = β0 + β1·x_g（权重 w_g = 1/u_g²；
+任一点 u_g=0 时退化为等权重并告警），返回截距、斜率、拟合值、残差、
+标准化残差、加权 R²。**两套回归系数协方差并列**：
+
+* **GUM 协方差（含标准件不确定度）** Cov_β = A·diag(u_g²)·Aᵀ，
+  A=(XᵀWX)⁻¹XᵀW（逆方差权重下即 (XᵀWX)⁻¹）——测量方案传播「系数与
+  标准件不确定度」时使用；系数显著性默认取该协方差的正态 z 检验；
+* **经典回归协方差** s²(XᵀWX)⁻¹，s²=Σw e²/(G−2)，配 t_{p,G−2}
+  （G=2 时残差自由度为 0，不给经典区间）；
+
+另有失配检验 χ²_lof = Σ(e_g/u_g)² ~ χ²(G−2)，考察线性模型与所声明
+不确定度是否相容。汇总给总体加权平均偏倚及其置信区间、%Linearity
+（100·|斜率|，AIAG 口径）、量程内偏倚摆动量与过程公差占比，以及
+**适用量程 [min 参考值, max 参考值]**。
+
+### 不外推、状态流转与原子复制
+
+* 参考点不足 2 个、参考值无变差或设计矩阵奇异时
+  `regression_available=false` 并给出 `fit_failure_reason`；
+  参考值跨度对工作量程的覆盖率
+  (x_max−x_min)/(量程上限−下限) 低于研究声明的 `min_span_coverage`
+  （默认 0.5）时 `coverage_adequate=false`。两类研究都**不得外推**，
+  且不具备采用条件（`adoptable=false`，`adoption_blockers` 列原因）。
+* 草案可**复制**：逐读数注明原因排除异常读数（原因必填），可清空整个
+  标准点（其余至少 2 点即可），副本附 `comparison_with_parent`，逐点
+  对照平均偏倚、置信区间、显著性（被清空的点 `dropped=true`、after
+  字段为 null）与截距 / 斜率 / 适用量程 / 可采用性变化；父研究不变。
+  **复制是原子的**：重放拟合与差异计算全部成功后才写入新版本，任何
+  校验或计算失败（未知读数、剩余点不足、拟合失效）都返回 422 且不产生
+  版本行。
+* `finalize` 定稿（只有草案可定稿，定稿后不可复制 / 改写）；`adopt`
+  采用（必须已定稿、拟合可用且覆盖达标，重复采用 422）。各状态只推进、
+  不回退；核查点 / 读数 / 结果快照创建时固化，重复 GET 内容不变。
+
+### 已采用研究接入测量方案
+
+建测量方案时用 `linearity_studies: {"L1": <study_id>}` 引用**已采用**
+研究（示例 `examples/measurement_plan_with_linearity.json`）：该尺寸
+不得再手填 `bias_correction / bias_std_uncertainty`，偏倚改由线性模型
+按实测值给出——模型偏倚 b(x)=a+b·x，检验批次按**逆回归**
+`x_c = (x−a)/(1+b)` 修正，并把 GUM 系数协方差（含标准件 u(ref)）按
+各实测值梯度传播（∂x_c/∂a=−1/(1+b)，∂x_c/∂b=−(x−a)/(1+b)²）；
+固定种子蒙特卡洛对整批共用同一组回归系数误差样本，GUM 与 MC 并列。
+**修正只在研究适用量程内生效，量程外不修正、不传播模型不确定度
+（禁止外推）**，该读数在响应中标注 `in_applicable_range=false`。
+封闭环按方向系数把各实测值的线性项方差相加（不同研究间相互独立）。
+研究错链 / 不存在 / 尺寸不匹配 / 未采用（草案或已定稿）均拒绝建方案。
+研究 id 与模型随方案快照冻结，历史测量方案与检验批次保持原结果。
+
 ## 校验拒绝（HTTP 422）
 
 * 名义值 ≤ 0；下偏差 > 上偏差；正态未给 σ；
@@ -855,6 +964,14 @@ s_i·(x̄_i,末批 − x̄_i,首批)，占比按各贡献**绝对值之和**归�
   重复、CUSUM k/h 或 EWMA L 非正、λ 越界（0<λ≤1）、最小样本量 < 1、
   复制时排除非父研究来源批次、排除原因空、排除后不足 2 批、对已定稿
   研究复制或重复定稿（422）。
+* 量具线性与偏倚研究：尺寸不在基线链上、工作量程下限 ≥ 上限、标准件
+  编号 / 核查点 id 重复、同点 (操作者, 重复序号) 组合重复、测量次序
+  重复、读数 / 参考值非有限、参考值标准不确定度为负、少于 2 个核查点、
+  参考值超出工作量程（跨单位换算后）、复制时排除不存在的读数或原因空、
+  排除后不足 2 个有读数核查点、对已定稿 / 已采用研究复制、未定稿即采用、
+  重复定稿 / 重复采用、拟合失效或量程覆盖不足时采用（422）；测量方案
+  引用线性研究时研究不存在 / 错链 / 尺寸不匹配 / 未采用，或同时手填
+  bias_correction / bias_std_uncertainty（422）。
 
 ## 测试
 
@@ -862,7 +979,7 @@ s_i·(x̄_i,末批 − x̄_i,首批)，占比按各贡献**绝对值之和**归�
 .venv/bin/python -m pytest -q
 ```
 
-311 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
+357 个用例覆盖：图校验、矩阵半正定、混合单位规范化、单边公差偏移、
 WC/RSS 手算值核对、相关系数对 σ_C 的方向性影响、copula 蒙特卡洛、
 种子可复现性、方案分支不覆盖基线、批量调整与成本搜索、检验批次统计、
 测量方案合成不确定度手算核对、方案校验拒收（缺覆盖因子/负分量/
@@ -900,4 +1017,12 @@ first_spec_breach 为 null 且不出现空 breach_side、分量超差率在热�
 CUSUM/EWMA 首次报警批次方向与变点、最小样本量剔除、量具偏倚修正与
 u_g 计入标准误、封闭环 GUM 传播手算核对、各尺寸封闭环漂移带符号贡献、
 复制排除后报警消失与前后结论比较、定稿后不可复制 / 重复定稿、研究
-快照重复 GET 不变。
+快照重复 GET 不变；量具线性与偏倚研究的 t 分位、加权回归截距 / 斜率 /
+残差 / GUM 与经典协方差 / 失配检验手算核对、GUM 协方差与
+A·diag(u²)·Aᵀ 传播一致、逐点平均偏倚置信区间与显著性、u(ref) 放宽使
+斜率不显著、两点可拟合但无经典推断、单点借用合并重复性 / 无重复不可估、
+混合单位换算、编号 / 重复组合 / 测量次序 / 量程越界等拒收、覆盖过窄
+不可采用、整点排除后比较结果 dropped 处理（不产生 500）、复制失败原子
+不落新版本、草稿→定稿→采用状态机、采用研究接入方案后的逆回归修正与
+GUM/MC 不确定度传播（含封闭环）、量程外不外推、同种子可复现及历史
+方案 / 批次结果不变。

@@ -2712,12 +2712,16 @@ def copy_linearity_study(study_id: int,
              (e.point_id, e.operator, e.replicate)]["measurement_order"]}
         for e in payload.exclusions
     ]
+
+    # ---- 原子性：重放拟合与前后结论对照必须全部成功，之后才允许写库；
+    #      任一步出错都不产生新版本行（失败响应与持久化状态保持一致）
     try:
         result = run_linearity_study(
             new_payload, exclusions=exclusions_store,
             copied_from={"parent_study_id": parent.id,
                          "parent_name": parent.name,
                          "excluded_readings": exclusions_store})
+        comparison = compare_linearity_results(parent.result_json, result)
     except LinearityError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -2728,7 +2732,6 @@ def copy_linearity_study(study_id: int,
         new_payload.model_dump(mode="json"), result,
         exclusions=exclusions_store, parent_study_id=parent.id,
         version_no=new_no)
-    comparison = compare_linearity_results(parent.result_json, result)
     comparison["parent_study_id"] = parent.id
     comparison["copied_study_id"] = new_id
     saved = db.get_linearity_study(new_id)

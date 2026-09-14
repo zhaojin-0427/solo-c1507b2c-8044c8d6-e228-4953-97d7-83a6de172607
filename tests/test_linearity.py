@@ -434,6 +434,95 @@ def test_copy_cannot_empty_points(client):
     assert r.status_code == 422
 
 
+def test_copy_dropping_whole_standard_point_succeeds(client):
+    """整点三条读数全部标为异常：其余 4 点仍可拟合，副本 201 且
+    comparison 中该点标记 dropped、after 字段为 None（不产生 500）。"""
+    cid = _make_chain(client)
+    sid = _create_study(client, cid)["study_id"]
+    excl = [
+        {"point_id": "P3", "operator": "A", "replicate": 1,
+         "reason": "测量时碰动标准件"},
+        {"point_id": "P3", "operator": "B", "replicate": 2,
+         "reason": "测量时碰动标准件"},
+        {"point_id": "P3", "operator": "A", "replicate": 3,
+         "reason": "测量时碰动标准件"},
+    ]
+    r = client.post(f"/linearity-studies/{sid}/copy",
+                    json={"name": "drop-P3", "exclusions": excl})
+    assert r.status_code == 201, r.text
+    j = r.json()
+    comp = j["comparison_with_parent"]
+    p3 = next(t for t in comp["points"] if t["point_id"] == "P3")
+    assert p3["dropped"] is True
+    assert p3["present_before"] is True
+    assert p3["present_after"] is False
+    assert p3["mean_bias_mm_after"] is None
+    assert p3["bias_significant_after"] is None
+    assert p3["confidence_interval_mm_after"] is None
+    assert p3["reading_count_before"] == 3
+    assert p3["reading_count_after"] == 0
+    kept = [t for t in comp["points"] if t["point_id"] != "P3"]
+    assert all(t["dropped"] is False and t["present_after"] is True
+               and t["reading_count_after"] == 3 for t in kept)
+    # 副本结果只含 4 个点、12 条读数，回归仍可用
+    assert len(j["result"]["points"]) == 4
+    assert j["result"]["design"]["total_readings"] == 12
+    assert j["result"]["design"]["excluded_readings"] == 3
+    assert j["result"]["regression_available"] is True
+    assert comp["regression_after"] is not None
+    # 父研究保持 5 点不变
+    g = client.get(f"/linearity-studies/{sid}").json()
+    assert len(g["result"]["points"]) == 5
+
+
+def test_copy_is_atomic_failure_writes_no_version(client):
+    """复制任一步失败（未知读数 / 排除后点数不足）都不得写入新版本行。"""
+    cid = _make_chain(client)
+    sid = _create_study(client, cid)["study_id"]
+
+    def version_count():
+        return len(client.get(
+            f"/chains/{cid}/linearity-studies").json()["studies"])
+
+    assert version_count() == 1
+    r = client.post(f"/linearity-studies/{sid}/copy", json={
+        "exclusions": [{"point_id": "P3", "operator": "ZZ",
+                        "replicate": 1, "reason": "x"}]})
+    assert r.status_code == 422
+    assert version_count() == 1
+
+    excl = []
+    for pid in ("P1", "P2", "P3", "P4"):
+        for op, r_ in (("A", 1), ("B", 2), ("A", 3)):
+            excl.append({"point_id": pid, "operator": op,
+                         "replicate": r_, "reason": "clear"})
+    r = client.post(f"/linearity-studies/{sid}/copy",
+                    json={"exclusions": excl})
+    assert r.status_code == 422
+    assert version_count() == 1  # 只剩 1 点：拟合不可用，无新版本落库
+
+
+def test_compare_results_handles_dropped_point_directly():
+    p1 = LinearityStudyCreate(**_study_payload())
+    r1 = run_study(p1)
+    excl = [
+        {"point_id": "P3", "operator": "A", "replicate": 1, "reason": "x"},
+        {"point_id": "P3", "operator": "B", "replicate": 2, "reason": "x"},
+        {"point_id": "P3", "operator": "A", "replicate": 3, "reason": "x"},
+    ]
+    r2 = run_study(p1, exclusions=excl)
+    comp = compare_results(r1, r2)
+    assert len(comp["points"]) == 5
+    p3 = next(t for t in comp["points"] if t["point_id"] == "P3")
+    assert p3["dropped"] is True
+    assert p3["mean_bias_mm_after"] is None
+    assert p3["bias_significant_after"] is None
+    assert p3["reading_count_after"] == 0
+    # 不抛异常且其余点照常比较
+    assert all(t["reading_count_after"] == 3
+               for t in comp["points"] if not t["dropped"])
+
+
 def test_finalized_study_not_copyable(client):
     cid = _make_chain(client)
     sid = _create_study(client, cid)["study_id"]

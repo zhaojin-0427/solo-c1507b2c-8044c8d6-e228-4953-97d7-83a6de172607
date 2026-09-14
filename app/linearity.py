@@ -689,23 +689,26 @@ def compare_results(base_result: dict[str, Any],
     new_by = {p["point_id"]: p for p in new_result["points"]}
     points = []
     for pid, bp in base_by.items():
-        np_ = new_by.get(pid)
+        nq = new_by.get(pid)  # 整点被排除时该核查点在副本中不存在
         points.append({
             "point_id": pid,
             "standard_serial": bp["standard_serial"],
             "present_before": True,
-            "present_after": np_ is not None,
+            "present_after": nq is not None,
             "mean_bias_mm_before": bp["mean_bias_mm"],
-            "mean_bias_mm_after": np_["mean_bias_mm"] if np_ else None,
+            "mean_bias_mm_after": nq["mean_bias_mm"] if nq is not None else None,
+            "confidence_interval_mm_before": bp["confidence_interval_mm"],
+            "confidence_interval_mm_after": (
+                nq["confidence_interval_mm"] if nq is not None else None),
             "bias_significant_before": bp["bias_significant"],
             "bias_significant_after": (
-                np_["bias_significant"] if np else None),
+                nq["bias_significant"] if nq is not None else None),
             "significance_changed": (
-                np_ is not None
-                and bp["bias_significant"] != np_["bias_significant"]),
+                nq is not None
+                and bp["bias_significant"] != nq["bias_significant"]),
             "reading_count_before": bp["reading_count"],
-            "reading_count_after": np_["reading_count"] if np else 0,
-            "dropped": np_ is None,
+            "reading_count_after": nq["reading_count"] if nq is not None else 0,
+            "dropped": nq is None,
         })
 
     def reg_sig(res: dict[str, Any]) -> dict[str, Any] | None:
